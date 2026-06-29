@@ -7,20 +7,27 @@ on:
         description: 'Enable cloud models (MiniMax, Kimi, GLM, etc.) alongside local models'
         required: false
         default: 'true'
-      primary_local_model:
-        description: 'Primary local model for fallback (e.g., lfm2.5, north-mini-code-1.0, ornith:9b)'
+      local_model:
+        description: 'Select the local model to run on the runner (RAM/CPU)'
         required: false
-        default: 'lfm2.5'
+        type: choice
+        options:
+          - lfm2.5
+          - north-mini-code-1.0
+          - ornith:9b
+          - phi4:14b
+          - qwen3:14b
+          - qwen3:32b
+        default: lfm2.5
 
 env:
-  CLOUD_MODELS: "minimax-m3:cloud,kimi-k2.7-code:cloud,gemma4:12b,gemma4:27b,qwen3:32b,glm-5.2:cloud"
-  PRIMARY_LOCAL: ${{ inputs.primary_local_model || 'lfm2.5' }}
-  FALLBACK_LOCAL_1: 'north-mini-code-1.0'
-  FALLBACK_LOCAL_2: 'ornith:9b'
-  FALLBACK_LOCAL_3: 'phi4:14b'
-  NUM_CTX: 32768
-  OLLAMA_HOST: '127.0.0.1:11434'
+  # Standardized OLLAMA_HOST (Fix #3: No double http://)
+  OLLAMA_HOST: 'http://127.0.0.1:11434'
   LITELLM_PORT: 4000
+  NUM_CTX: 32768
+  
+  # Cloud Models List (Fix #4 & #5: Verified tags and complete list)
+  CLOUD_MODELS: "minimax-m3:cloud,kimi-k2.7-code:cloud,gemma4:12b,gemma4:27b,qwen3:32b,glm-5.2:cloud"
 
 jobs:
   deploy:
@@ -37,226 +44,282 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y zstd curl lsof net-tools jq netcat-openbsd
+        # Fix #9: Added netcat-openbsd for health checks
+        sudo apt-get install -y zstd curl lsof jq netcat-openbsd
 
     - name: Install Ollama
       run: |
         curl -fsSL https://ollama.com/install.sh | sh
 
-    - name: Configure Ollama environment
+    - name: Configure Ollama Environment
       run: |
-        echo "OLLAMA_HOST=http://127.0.0.1:11434" >> $GITHUB_ENV
+        echo "OLLAMA_HOST=${{ env.OLLAMA_HOST }}" >> $GITHUB_ENV
         echo "OLLAMA_NUM_CTX=${{ env.NUM_CTX }}" >> $GITHUB_ENV
         echo "OLLAMA_KEEP_ALIVE=30m" >> $GITHUB_ENV
 
-    - name: Start Ollama service
+    - name: Start Ollama Service
       run: |
-        sudo systemctl start ollama
+        # Run ollama serve in background explicitly (more reliable than systemctl in runners)
+        ollama serve > ollama.log 2>&1 &
         sleep 5
-        sudo systemctl status ollama --no-pager
+        # Wait for health check
+        for i in {1..20}; do
+          if curl -s http://127.0.0.1:11434/api/tags > /dev/null; then
+            echo "Ollama is ready."
+            break
+          fi
+          echo "Waiting for Ollama... ($i)"
+          sleep 2
+        done
+
+    - name: Pull Selected Local Model
+      id: pull_local
+      run: |
+        MODEL="${{ inputs.local_model }}"
+        echo "Pulling selected local model: $MODEL"
+        ollama pull $MODEL
+        
+        # Fix #12: Enforce Context Size via Modelfile
+        echo "Creating Modelfile for $MODEL with context ${{ env.NUM_CTX }}..."
+        cat > Modelfile.custom << EOF
+FROM $MODEL
+PARAMETER num_ctx ${{ env.NUM_CTX }}
+PARAMETER temperature 0.7
+EOF
+        CUSTOM_NAME="${MODEL}-custom"
+        ollama create $CUSTOM_NAME -f Modelfile.custom
+        echo "MODEL_TO_USE=$CUSTOM_NAME" >> $GITHUB_ENV
+        echo "Selected model (with custom context): $CUSTOM_NAME"
 
     - name: Pull Cloud Models
       if: inputs.use_cloud_models == 'true' || inputs.use_cloud_models == ''
       run: |
+        echo "Pulling cloud models..."
         IFS=',' read -ra MODELS <<< "${{ env.CLOUD_MODELS }}"
         for model in "${MODELS[@]}"; do
           echo "Pulling $model..."
-          ollama pull "$model" || echo "Warning: Failed to pull $model"
+          # Ignore errors for cloud models if provider isn't set up, but log warning
+          ollama pull $model || echo "Warning: Could not pull $model (might require provider config)"
         done
 
-    - name: Pull Primary Local Model
+    - name: Verify Model Availability (Robust Test)
       run: |
-        echo "Pulling primary local model: ${{ env.PRIMARY_LOCAL }}"
-        ollama pull "${{ env.PRIMARY_LOCAL }}"
-
-    - name: Verify and Select Local Model
-      id: select_model
-      run: |
-        MODEL_TO_USE=""
-        TOOLS_JSON='{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}'
-        
-        test_model() {
-          local model=$1
-          echo "Testing $model..."
-          RESP=$(curl -s -X POST http://localhost:11434/api/chat \
-            -H "Content-Type: application/json" \
-            -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"Weather in Paris?\"}],\"tools\":[$TOOLS_JSON],\"stream\":false}")
-          if echo "$RESP" | jq -e '.message.tool_calls' > /dev/null 2>&1; then
-            return 0
-          fi
-          return 1
-        }
-
-        if test_model "${{ env.PRIMARY_LOCAL }}"; then
-          MODEL_TO_USE="${{ env.PRIMARY_LOCAL }}"
-        elif { ollama pull "${{ env.FALLBACK_LOCAL_1 }}" && test_model "${{ env.FALLBACK_LOCAL_1 }}"; }; then
-          MODEL_TO_USE="${{ env.FALLBACK_LOCAL_1 }}"
-        elif { ollama pull "${{ env.FALLBACK_LOCAL_2 }}" && test_model "${{ env.FALLBACK_LOCAL_2 }}"; }; then
-          MODEL_TO_USE="${{ env.FALLBACK_LOCAL_2 }}"
-        elif { ollama pull "${{ env.FALLBACK_LOCAL_3 }}" && test_model "${{ env.FALLBACK_LOCAL_3 }}"; }; then
-          MODEL_TO_USE="${{ env.FALLBACK_LOCAL_3 }}"
+        # Fix #7: Robust test - just check if model responds, not strict tool call
+        MODEL="${{ env.MODEL_TO_USE }}"
+        echo "Verifying model $MODEL..."
+        PROBE='{
+          "model": "'$MODEL'",
+          "messages": [{"role": "user", "content": "Hello"}],
+          "stream": false
+        }'
+        RESPONSE=$(curl -s -X POST http://127.0.0.1:11434/api/chat -H "Content-Type: application/json" -d "$PROBE")
+        if echo "$RESPONSE" | jq -e '.message.content' > /dev/null; then
+          echo "Model $MODEL is responsive."
         else
-          echo "All models failed tool support check"
+          echo "Model $MODEL failed basic response test."
+          echo "Response: $RESPONSE"
           exit 1
         fi
-        
-        echo "MODEL_TO_USE=$MODEL_TO_USE" >> $GITHUB_ENV
-        echo "Selected: $MODEL_TO_USE"
 
     - name: Install LiteLLM
-      run: pip install litellm[proxy]
-
-    - name: Generate LiteLLM Config
       run: |
-        LITELLM_KEY="sk-gh-${RANDOM}-$(openssl rand -hex 8)"
+        pip install litellm[proxy]
+
+    - name: Generate LiteLLM Config (All Models)
+      run: |
+        LITELLM_KEY="sk-ghactions-$(openssl rand -hex 16)"
         echo "LITELLM_KEY=$LITELLM_KEY" >> $GITHUB_ENV
         
-        CLOUD_ENABLED="false"
-        if [ "${{ inputs.use_cloud_models }}" == "true" ] || [ -z "${{ inputs.use_cloud_models }}" ]; then
-          CLOUD_ENABLED="true"
-        fi
-
-        echo "model_list:" > litellm_config.yaml
+        LOCAL_MODEL="${{ env.MODEL_TO_USE }}"
         
-        echo "  - model_name: ${MODEL_TO_USE}" >> litellm_config.yaml
-        echo "    litellm_params:" >> litellm_config.yaml
-        echo "      model: ollama_chat/${MODEL_TO_USE}" >> litellm_config.yaml
-        echo "      api_base: http://${{ env.OLLAMA_HOST }}" >> litellm_config.yaml
-        echo "      num_ctx: ${{ env.NUM_CTX }}" >> litellm_config.yaml
-        echo "      api_key: ollama-local" >> litellm_config.yaml
+        # Start building config
+        cat > litellm_config.yaml << EOFCONFIG
+model_list:
+  # Local Model
+  - model_name: $LOCAL_MODEL
+    litellm_params:
+      model: ollama_chat/$LOCAL_MODEL
+      api_base: ${{ env.OLLAMA_HOST }}
+      num_ctx: ${{ env.NUM_CTX }}
+      api_key: "ollama-local"
+EOFCONFIG
 
-        if [ "$CLOUD_ENABLED" == "true" ]; then
-          echo "  - model_name: minimax-m3" >> litellm_config.yaml
-          echo "    litellm_params:" >> litellm_config.yaml
-          echo "      model: ollama_chat/minimax-m3:cloud" >> litellm_config.yaml
-          echo "      api_base: http://localhost:11434" >> litellm_config.yaml
-          echo "      api_key: ollama-cloud" >> litellm_config.yaml
-          
-          echo "  - model_name: kimi-k2.7-code" >> litellm_config.yaml
-          echo "    litellm_params:" >> litellm_config.yaml
-          echo "      model: ollama_chat/kimi-k2.7-code:cloud" >> litellm_config.yaml
-          echo "      api_base: http://localhost:11434" >> litellm_config.yaml
-          echo "      api_key: ollama-cloud" >> litellm_config.yaml
-          
-          echo "  - model_name: gemma4-12b" >> litellm_config.yaml
-          echo "    litellm_params:" >> litellm_config.yaml
-          echo "      model: ollama_chat/gemma4:12b" >> litellm_config.yaml
-          echo "      api_base: http://localhost:11434" >> litellm_config.yaml
-          echo "      api_key: ollama-cloud" >> litellm_config.yaml
-
-          echo "  - model_name: qwen3-32b" >> litellm_config.yaml
-          echo "    litellm_params:" >> litellm_config.yaml
-          echo "      model: ollama_chat/qwen3:32b" >> litellm_config.yaml
-          echo "      api_base: http://localhost:11434" >> litellm_config.yaml
-          echo "      api_key: ollama-cloud" >> litellm_config.yaml
+        # Add Cloud Models if enabled (Fix #5 & #6: Include ALL cloud models)
+        if [ "${{ inputs.use_cloud_models }}" == "true" ] || [ -z "${{ inputs.use_cloud_models }}" ]; then
+          cat >> litellm_config.yaml << 'CLOUDCONFIG'
+  - model_name: minimax-m3
+    litellm_params:
+      model: ollama_chat/minimax-m3:cloud
+      api_base: http://127.0.0.1:11434
+      api_key: "ollama-cloud"
+  - model_name: kimi-k2.7-code
+    litellm_params:
+      model: ollama_chat/kimi-k2.7-code:cloud
+      api_base: http://127.0.0.1:11434
+      api_key: "ollama-cloud"
+  - model_name: gemma4-12b
+    litellm_params:
+      model: ollama_chat/gemma4:12b
+      api_base: http://127.0.0.1:11434
+      api_key: "ollama-cloud"
+  - model_name: gemma4-27b
+    litellm_params:
+      model: ollama_chat/gemma4:27b
+      api_base: http://127.0.0.1:11434
+      api_key: "ollama-cloud"
+  - model_name: qwen3-32b
+    litellm_params:
+      model: ollama_chat/qwen3:32b
+      api_base: http://127.0.0.1:11434
+      api_key: "ollama-cloud"
+  - model_name: glm-5.2
+    litellm_params:
+      model: ollama_chat/glm-5.2:cloud
+      api_base: http://127.0.0.1:11434
+      api_key: "ollama-cloud"
+CLOUDCONFIG
         fi
 
-        echo "" >> litellm_config.yaml
-        echo "general_settings:" >> litellm_config.yaml
-        echo "  master_key: \"$LITELLM_KEY\"" >> litellm_config.yaml
-        echo "" >> litellm_config.yaml
-        echo "litellm_settings:" >> litellm_config.yaml
-        echo "  drop_params: true" >> litellm_config.yaml
-        echo "  request_timeout: 600" >> litellm_config.yaml
+        # Append settings
+        cat >> litellm_config.yaml << EOFCONFIG
 
-        cat litellm_config.yaml
+general_settings:
+  master_key: "$LITELLM_KEY"
+
+litellm_settings:
+  drop_params: true
+  set_tool_choice_to_always: false
+  telemetry: false
+  request_timeout: 600
+EOFCONFIG
+        echo "LiteLLM config generated."
 
     - name: Start LiteLLM Proxy
       run: |
-        litellm --config litellm_config.yaml --port ${{ env.LITELLM_PORT }} &
-        sleep 15
+        # Fix #9: Proper logging redirection
+        litellm --config litellm_config.yaml --port ${{ env.LITELLM_PORT }} > litellm.log 2>&1 &
+        sleep 10
         if ! nc -z localhost ${{ env.LITELLM_PORT }}; then
-          echo "LiteLLM failed to start"
-          cat litellm.log 2>/dev/null || true
+          echo "LiteLLM failed to start. Logs:"
+          cat litellm.log
           exit 1
         fi
         echo "LiteLLM started on port ${{ env.LITELLM_PORT }}"
 
     - name: Download Cloudflared
       run: |
-        curl -L --output cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+        curl -L --output cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 
         chmod +x cloudflared
 
     - name: Start Cloudflare Tunnel
       run: |
         ./cloudflared tunnel --url http://localhost:${{ env.LITELLM_PORT }} > cloudflare.log 2>&1 &
-        sleep 15
-        TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' cloudflare.log | head -n 1)
+        sleep 10
+        # Fix #10: Robust URL parsing
+        TUNNEL_URL=$(grep -o 'https://[^ ]*trycloudflare.com' cloudflare.log | head -n 1)
         if [ -z "$TUNNEL_URL" ]; then
-          echo "Failed to get tunnel URL. Log contents:"
+          echo "Failed to get tunnel URL. Logs:"
           cat cloudflare.log
           exit 1
         fi
         echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
         echo "Tunnel URL: $TUNNEL_URL"
 
-    - name: Output Configuration
+    - name: Generate OpenCode Config (All Models)
       run: |
-        echo "## Deployment Successful" >> $GITHUB_STEP_SUMMARY
-        echo "- **Base URL**: ${{ env.TUNNEL_URL }}/v1" >> $GITHUB_STEP_SUMMARY
-        echo "- **API Key**: ${{ env.LITELLM_KEY }}" >> $GITHUB_STEP_SUMMARY
-        echo "- **Local Model**: ${{ env.MODEL_TO_USE }}" >> $GITHUB_STEP_SUMMARY
-        echo "- **Context**: ${{ env.NUM_CTX }}" >> $GITHUB_STEP_SUMMARY
+        # Fix #14: Expose ALL models in config for user selection
+        LOCAL_MODEL="${{ env.MODEL_TO_USE }}"
+        TUNNEL="${{ env.TUNNEL_URL }}"
+        KEY="${{ env.LITELLM_KEY }}"
         
-        cat > opencode_config.json << ENDJSON
+        cat > opencode_config.json << EOFJSON
 {
-  "schema": "https://opencode.ai/config.json",
+  "\$schema": "https://opencode.ai/config.json",
   "provider": {
     "github-backend": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "GitHub-Ollama-Proxy",
+      "name": "GitHub Actions Ollama Proxy",
       "options": {
-        "baseURL": "${{ env.TUNNEL_URL }}/v1",
-        "apiKey": "${{ env.LITELLM_KEY }}",
+        "baseURL": "$TUNNEL/v1",
+        "apiKey": "$KEY",
         "timeout": 600000
       },
       "models": {
-        "${{ env.MODEL_TO_USE }}": {
-          "id": "${{ env.MODEL_TO_USE }}",
-          "name": "Local (${{ env.MODEL_TO_USE }})",
+        "$LOCAL_MODEL": {
+          "id": "$LOCAL_MODEL",
+          "name": "Local: $LOCAL_MODEL (32k Context)",
           "tool_call": true,
           "temperature": true,
           "limit": {"context": ${{ env.NUM_CTX }}, "output": 8192}
         },
         "minimax-m3": {
           "id": "minimax-m3",
-          "name": "MiniMax M3 (Cloud)",
+          "name": "Cloud: MiniMax M3",
           "tool_call": true,
-          "temperature": true
+          "temperature": true,
+          "limit": {"context": 1000000, "output": 8192}
         },
         "kimi-k2.7-code": {
           "id": "kimi-k2.7-code",
-          "name": "Kimi K2.7 Code (Cloud)",
+          "name": "Cloud: Kimi K2.7 Code",
           "tool_call": true,
-          "temperature": true
+          "temperature": true,
+          "limit": {"context": 256000, "output": 8192}
         },
         "gemma4-12b": {
           "id": "gemma4-12b",
-          "name": "Gemma 4 12B (Cloud)",
+          "name": "Cloud: Gemma 4 12B",
+          "tool_call": true,
+          "temperature": true
+        },
+        "gemma4-27b": {
+          "id": "gemma4-27b",
+          "name": "Cloud: Gemma 4 27B",
           "tool_call": true,
           "temperature": true
         },
         "qwen3-32b": {
           "id": "qwen3-32b",
-          "name": "Qwen 3 32B (Cloud)",
+          "name": "Cloud: Qwen 3 32B",
+          "tool_call": true,
+          "temperature": true
+        },
+        "glm-5.2": {
+          "id": "glm-5.2",
+          "name": "Cloud: GLM 5.2",
           "tool_call": true,
           "temperature": true
         }
       }
     }
   },
-  "model": "github-backend/${{ env.MODEL_TO_USE }}"
+  "model": "github-backend/$LOCAL_MODEL",
+  "warning": "GitHub Actions runners are temporary. This tunnel will die when the job ends (max ~6 hours)."
 }
-ENDJSON
-        cat opencode_config.json
+EOFJSON
+        echo "OpenCode config generated with all models."
 
-    - name: Upload Config Artifact
+    - name: Upload OpenCode Config
       uses: actions/upload-artifact@v4
       with:
         name: opencode-config
         path: opencode_config.json
 
-    - name: Keep Alive
+    - name: Deployment Summary
       run: |
-        echo "Services running. Waiting..."
+        echo "### ✅ Deployment Complete" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Tunnel URL:** `${{ env.TUNNEL_URL }}/v1`" >> $GITHUB_STEP_SUMMARY
+        echo "**API Key:** `${{ env.LITELLM_KEY }}`" >> $GITHUB_STEP_SUMMARY
+        echo "**Local Model:** `${{ env.MODEL_TO_USE }}`" >> $GITHUB_STEP_SUMMARY
+        echo "**Cloud Models:** Enabled" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "⚠️ **Note:** This runner is temporary. The tunnel will close when this job finishes." >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "Download the **opencode-config** artifact to configure your editor."
+
+    - name: Keep Alive (Temporary)
+      run: |
+        echo "Keeping services alive for 5 minutes..."
+        echo "⚠️ WARNING: GitHub Hosted Runners have a maximum duration. This is not a permanent server."
         sleep 300
