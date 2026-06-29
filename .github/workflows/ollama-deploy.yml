@@ -143,52 +143,72 @@ jobs:
               api_base: http://${{ env.OLLAMA_HOST }}
               num_ctx: ${{ env.NUM_CTX }}
               api_key: "ollama-local"
-EOF
+
+    - name: Generate LiteLLM config with All Models
+      run: |
+        LITELLM_KEY="sk-ghactions-${RANDOM}-$(openssl rand -hex 16)"
+        echo "LITELLM_KEY=$LITELLM_KEY" >> $GITHUB_ENV
+
+        # Build model list dynamically
+        cat > litellm_config.yaml << EOFCONFIG
+model_list:
+  # Local Fallback Model
+  - model_name: ${MODEL_TO_USE}
+    litellm_params:
+      model: ollama_chat/${MODEL_TO_USE}
+      api_base: http://${{ env.OLLAMA_HOST }}
+      num_ctx: ${{ env.NUM_CTX }}
+      api_key: "ollama-local"
+EOFCONFIG
 
         # Add cloud models if enabled
         if [ "${{ inputs.use_cloud_models }}" == "true" ] || [ -z "${{ inputs.use_cloud_models }}" ]; then
-          cat >> litellm_config.yaml << EOF
-          - model_name: minimax-m3
-            litellm_params:
-              model: ollama_chat/minimax-m3:cloud
-              api_base: http://${{ env.OLLAMA_HOST }}
-              api_key: "ollama-cloud"
-          - model_name: kimi-k2.7-code
-            litellm_params:
-              model: ollama_chat/kimi-k2.7-code:cloud
-              api_base: http://${{ env.OLLAMA_HOST }}
-              api_key: "ollama-cloud"
-          - model_name: gemma4-12b
-            litellm_params:
-              model: ollama_chat/gemma4:12b
-              api_base: http://${{ env.OLLAMA_HOST }}
-              api_key: "ollama-cloud"
-          - model_name: gemma4-31b
-            litellm_params:
-              model: ollama_chat/gemma4:31b
-              api_base: http://${{ env.OLLAMA_HOST }}
-              api_key: "ollama-cloud"
-          - model_name: qwen3.6-27b
-            litellm_params:
-              model: ollama_chat/qwen3.6:27b
-              api_base: http://${{ env.OLLAMA_HOST }}
-              api_key: "ollama-cloud"
-EOF
+          cat >> litellm_config.yaml << EOFCONFIG
+  - model_name: minimax-m3
+    litellm_params:
+      model: ollama_chat/minimax-m3:cloud
+      api_base: http://${{ env.OLLAMA_HOST }}
+      api_key: "ollama-cloud"
+  - model_name: kimi-k2.7-code
+    litellm_params:
+      model: ollama_chat/kimi-k2.7-code:cloud
+      api_base: http://${{ env.OLLAMA_HOST }}
+      api_key: "ollama-cloud"
+  - model_name: gemma4-12b
+    litellm_params:
+      model: ollama_chat/gemma4:12b
+      api_base: http://${{ env.OLLAMA_HOST }}
+      api_key: "ollama-cloud"
+  - model_name: gemma4-31b
+    litellm_params:
+      model: ollama_chat/gemma4:31b
+      api_base: http://${{ env.OLLAMA_HOST }}
+      api_key: "ollama-cloud"
+  - model_name: qwen3.6-27b
+    litellm_params:
+      model: ollama_chat/qwen3.6:27b
+      api_base: http://${{ env.OLLAMA_HOST }}
+      api_key: "ollama-cloud"
+  - model_name: glm-5.2
+    litellm_params:
+      model: ollama_chat/glm-5.2:cloud
+      api_base: http://${{ env.OLLAMA_HOST }}
+      api_key: "ollama-cloud"
+EOFCONFIG
         fi
 
-        cat >> litellm_config.yaml << EOF
+        cat >> litellm_config.yaml << EOFCONFIG
 
-        general_settings:
-          master_key: "$LITELLM_KEY"
+general_settings:
+  master_key: "$LITELLM_KEY"
 
-        litellm_settings:
-          drop_params: true
-          set_tool_choice_to_always: false
-          telemetry: false
-          request_timeout: 600
-EOF
+litellm_settings:
+  drop_params: true
+  set_tool_choice_to_always: false
+  telemetry: false
+  request_timeout: 600
+EOFCONFIG
         echo "LiteLLM config generated with models: ${MODEL_TO_USE} + cloud models"
-
     - name: Start LiteLLM proxy
       run: |
         litellm --config litellm_config.yaml --port ${{ env.LITELLM_PORT }} &
