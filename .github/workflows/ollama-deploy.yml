@@ -1,0 +1,297 @@
+name: Deploy Ollama + Qwen Coder + Cloudflare Tunnel
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_tag:
+        description: 'Ollama model tag to use (e.g., qwen2.5-coder:7b, qwen2.5-coder:14b)'
+        required: false
+        default: 'qwen2.5-coder:7b'
+
+env:
+  PRIMARY_MODEL: ${{ inputs.model_tag || 'qwen2.5-coder:7b' }}
+  CUSTOM_MODEL_NAME: 'qwen-coder-tools'
+  GENERAL_MODEL: 'qwen2.5:7b'
+  LAST_RESORT_MODEL: 'llama3.1:8b'
+  NUM_CTX: 32768
+  OLLAMA_HOST: '127.0.0.1:11434'
+  LITELLM_PORT: 4000
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y zstd curl lsof net-tools jq
+
+    - name: Install Ollama
+      run: |
+        curl -fsSL https://ollama.com/install.sh | sh
+
+    - name: Configure Ollama for CPU only
+      run: |
+        echo 'export OLLAMA_HOST=http://127.0.0.1:11434' >> $GITHUB_ENV
+        echo 'export OLLAMA_NUM_CTX=${{ env.NUM_CTX }}' >> $GITHUB_ENV
+        echo 'export OLLAMA_KEEP_ALIVE=30m' >> $GITHUB_ENV
+        echo 'export OLLAMA_FLASH_ATTENTION=0' >> $GITHUB_ENV
+        echo 'export OLLAMA_NUM_PARALLEL=1' >> $GITHUB_ENV
+
+    - name: Start Ollama service
+      run: |
+        sudo systemctl start ollama
+        sleep 5
+        sudo systemctl status ollama --no-pager
+
+    - name: Pull primary model
+      run: |
+        ollama pull ${{ env.PRIMARY_MODEL }}
+
+    - name: Create custom model with tools support
+      run: |
+        cat > Modelfile.tools << EOF
+        FROM ${{ env.PRIMARY_MODEL }}
+
+        SYSTEM You are a helpful AI assistant with access to tools. CRITICAL FORMAT RULE: When you need to invoke a tool, you MUST respond with a structured tool_calls API call. NEVER wrap tool call JSON inside the content field as plain text. Always use the proper structured tool_calls field on the assistant message.
+
+        PARAMETER num_ctx ${{ env.NUM_CTX }}
+        PARAMETER temperature 0.2
+        PARAMETER repeat_penalty 1.1
+        EOF
+        ollama create ${{ env.CUSTOM_MODEL_NAME }} -f Modelfile.tools
+
+    - name: Verify model tools support
+      run: |
+        MODEL_TAG="${{ env.CUSTOM_MODEL_NAME }}"
+        echo "Testing model: $MODEL_TAG"
+        PROBE='{
+          "model": "'$MODEL_TAG'",
+          "messages": [
+            {
+              "role": "user",
+              "content": "What'\''s the weather in Paris? Use the get_weather tool."
+            }
+          ],
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "description": "Get current weather for a city",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "city": {
+                      "type": "string"
+                    }
+                  },
+                  "required": ["city"]
+                }
+              }
+            }
+          ],
+          "stream": false
+        }'
+        
+        RESPONSE=$(curl -s -X POST http://localhost:11434/api/chat -H "Content-Type: application/json" -d "$PROBE")
+        echo "Response: $RESPONSE"
+        
+        if echo "$RESPONSE" | jq -e '.message.tool_calls' > /dev/null; then
+          echo "Model supports tools correctly."
+          echo "MODEL_TO_USE=$MODEL_TAG" >> $GITHUB_ENV
+        else
+          echo "Primary model verification failed. Trying fallback models..."
+          
+          # Fallback: General model
+          echo "Trying ${{ env.GENERAL_MODEL }}"
+          ollama pull ${{ env.GENERAL_MODEL }}
+          PROBE_GENERAL=$(echo "$PROBE" | sed "s/${{ env.CUSTOM_MODEL_NAME }}/${{ env.GENERAL_MODEL }}/g")
+          RESPONSE=$(curl -s -X POST http://localhost:11434/api/chat -H "Content-Type: application/json" -d "$PROBE_GENERAL")
+          if echo "$RESPONSE" | jq -e '.message.tool_calls' > /dev/null; then
+            echo "Model supports tools correctly."
+            echo "MODEL_TO_USE=${{ env.GENERAL_MODEL }}" >> $GITHUB_ENV
+          else
+            # Fallback: Last resort model
+            echo "Trying ${{ env.LAST_RESORT_MODEL }}"
+            ollama pull ${{ env.LAST_RESORT_MODEL }}
+            PROBE_LAST=$(echo "$PROBE" | sed "s/${{ env.CUSTOM_MODEL_NAME }}/${{ env.LAST_RESORT_MODEL }}/g")
+            RESPONSE=$(curl -s -X POST http://localhost:11434/api/chat -H "Content-Type: application/json" -d "$PROBE_LAST")
+            if echo "$RESPONSE" | jq -e '.message.tool_calls' > /dev/null; then
+              echo "Model supports tools correctly."
+              echo "MODEL_TO_USE=${{ env.LAST_RESORT_MODEL }}" >> $GITHUB_ENV
+            else
+              echo "No model supports tools correctly."
+              exit 1
+            fi
+          fi
+        fi
+
+    - name: Install LiteLLM
+      run: |
+        pip install litellm[proxy]
+
+    - name: Generate LiteLLM config
+      run: |
+        LITELLM_KEY="sk-ghactions-${RANDOM}-$(openssl rand -hex 16)"
+        echo "LITELLM_KEY=$LITELLM_KEY" >> $GITHUB_ENV
+        
+        cat > litellm_config.yaml << EOF
+        model_list:
+          - model_name: qwen
+            litellm_params:
+              model: ollama_chat/${{ env.MODEL_TO_USE }}
+              api_base: http://${{ env.OLLAMA_HOST }}
+              num_ctx: ${{ env.NUM_CTX }}
+              api_key: "ollama-local"
+
+        general_settings:
+          master_key: "$LITELLM_KEY"
+
+        litellm_settings:
+          drop_params: true
+          set_tool_choice_to_always: false
+          telemetry: false
+          request_timeout: 600
+        EOF
+
+    - name: Start LiteLLM proxy
+      run: |
+        litellm --config litellm_config.yaml --port ${{ env.LITELLM_PORT }} &
+        sleep 10
+        # Check if LiteLLM started
+        if ! nc -z localhost ${{ env.LITELLM_PORT }}; then
+          echo "LiteLLM failed to start"
+          exit 1
+        fi
+
+    - name: Test LiteLLM proxy
+      run: |
+        PROXY_PROBE='{
+          "model": "qwen",
+          "messages": [
+            {
+              "role": "user",
+              "content": "What'\''s the weather in Tokyo? Use the get_weather tool."
+            }
+          ],
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "description": "Get current weather for a city",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "city": {
+                      "type": "string"
+                    }
+                  },
+                  "required": ["city"]
+                }
+              }
+            }
+          ]
+        }'
+        
+        RESPONSE=$(curl -s -X POST http://localhost:${{ env.LITELLM_PORT }}/v1/chat/completions \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer ${{ env.LITELLM_KEY }}" \
+          -d "$PROXY_PROBE")
+        
+        echo "Proxy test response: $RESPONSE"
+        
+        if echo "$RESPONSE" | jq -e '.choices[0].message.tool_calls' > /dev/null; then
+          echo "LiteLLM proxy works correctly."
+        else
+          echo "LiteLLM proxy test failed."
+          exit 1
+        fi
+
+    - name: Download Cloudflared
+      run: |
+        curl -L --output cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+        chmod +x cloudflared
+
+    - name: Start Cloudflared tunnel
+      run: |
+        ./cloudflared tunnel --url http://localhost:${{ env.LITELLM_PORT }} > cloudflare.log 2>&1 &
+        sleep 10
+        TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' cloudflare.log | head -n 1)
+        if [ -z "$TUNNEL_URL" ]; then
+          echo "Failed to get tunnel URL from log:"
+          cat cloudflare.log
+          exit 1
+        fi
+        echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+        echo "Cloudflare tunnel URL: $TUNNEL_URL"
+
+    - name: Output connection details
+      run: |
+        echo "=== DEPLOYMENT COMPLETE ==="
+        echo "Base URL: ${{ env.TUNNEL_URL }}/v1"
+        echo "API Key: ${{ env.LITELLM_KEY }}"
+        echo "Model: ${{ env.MODEL_TO_USE }}"
+        echo "Context: ${{ env.NUM_CTX }}"
+        
+        # Generate OpenCode config
+        cat > opencode_config.json << EOF
+        {
+          "\$schema": "https://opencode.ai/config.json",
+          "provider": {
+            "gh-actions-backend": {
+              "npm": "@ai-sdk/openai-compatible",
+              "name": "GH-Actions-Ollama-Proxy",
+              "options": {
+                "baseURL": "${{ env.TUNNEL_URL }}/v1",
+                "apiKey": "${{ env.LITELLM_KEY }}",
+                "timeout": 600000
+              },
+              "models": {
+                "qwen": {
+                  "id": "qwen",
+                  "name": "Qwen 2.5 Coder (${{ env.MODEL_TO_USE }})",
+                  "tool_call": true,
+                  "temperature": true,
+                  "limit": {
+                    "context": ${{ env.NUM_CTX }},
+                    "output": 8192
+                  },
+                  "options": {
+                    "temperature": 0.2,
+                    "top_p": 0.95,
+                    "num_ctx": ${{ env.NUM_CTX }},
+                    "repeat_penalty": 1.1
+                  }
+                }
+              }
+            }
+          },
+          "model": "gh-actions-backend/qwen"
+        }
+        EOF
+        
+        echo "OpenCode Config:"
+        cat opencode_config.json
+
+    - name: Upload OpenCode Config
+      uses: actions/upload-artifact@v4
+      with:
+        name: opencode-config
+        path: opencode_config.json
+
+    - name: Keep alive and monitor (loop placeholder)
+      run: |
+        echo "Monitoring services..."
+        # In a real long-running scenario, you would implement a monitoring loop here
+        # Note: GitHub Actions has a maximum runtime limit per job (typically 6 hours)
+        # For continuous operation, consider using a self-hosted runner or external service
