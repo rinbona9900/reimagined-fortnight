@@ -4,38 +4,56 @@ name: Deploy Ollama + LiteLLM + Cloudflare Tunnel
 # 1. Installs Ollama on the GitHub-hosted runner.
 # 2. Pulls the ONE local model selected from the dropdown.
 # 3. Creates a custom Modelfile to enforce num_ctx at inference time.
-# 4. Optionally pulls cloud models from the Ollama registry.
+# 4. Optionally pulls ALL cloud models from the Ollama registry.
 # 5. Starts LiteLLM as an OpenAI-compatible proxy in front of Ollama.
 # 6. Opens a Cloudflare Quick Tunnel so LiteLLM is reachable remotely.
 # 7. Generates opencode_config.json listing every successfully pulled model.
 # 8. Stays alive up to ~5h50m, printing health status every 5 minutes.
 #
+# MODEL CLASSIFICATION (from ollama.com/search):
+#   CLOUD  - served remotely, no GPU needed on runner, pulled with :cloud tag
+#     glm-5.2:cloud          976K ctx
+#     minimax-m3:cloud       512K ctx
+#     kimi-k2.7-code:cloud   256K ctx
+#     nemotron-3-ultra:cloud 256K ctx
+#     nemotron-3-super:cloud 256K ctx (120B MoE)
+#     gemma4:e2b             cloud variant
+#     gemma4:e4b             cloud variant
+#
+#   LOCAL  - run on the runner CPU/RAM (choose one via dropdown)
+#     lfm2.5                 8B,  fast tool calling
+#     north-mini-code-1.0    30B MoE, 3B active, coding
+#     ornith:9b              9B,  256K ctx, coding
+#     gemma4:12b             12B, local size
+#     gemma4:26b             26B, local size
+#     qwen3.6:27b            27B, vision+tools
+#     qwen3.6:35b            35B, vision+tools
+#
 # ENV VARIABLE STRATEGY
-# ${{ env.VAR }} is evaluated BEFORE any step runs, so it cannot see values
-# written to $GITHUB_ENV by earlier steps.
-# Rule: ${{ env.VAR }} only for top-level env: block values.
-#       $VAR (bare shell) for anything written to $GITHUB_ENV at runtime.
-# GitHub auto-exports $GITHUB_ENV entries into every subsequent step's shell.
+#   ${{ env.VAR }}  -> safe only for top-level env: block (evaluated at parse time)
+#   $VAR            -> use for anything written to $GITHUB_ENV at runtime
+#   NEVER use ${{ env.VAR }} for a value set by a previous step - it will be empty.
 
 on:
   workflow_dispatch:
     inputs:
 
       local_model:
-        description: 'Local model to run on the runner'
+        description: 'Local model to run on the runner (pick based on RAM available ~7GB)'
         required: true
         type: choice
         options:
           - lfm2.5
           - north-mini-code-1.0
           - ornith:9b
-          - phi4:14b
-          - qwen3:14b
-          - qwen3:32b
+          - gemma4:12b
+          - gemma4:26b
+          - qwen3.6:27b
+          - qwen3.6:35b
         default: lfm2.5
 
       use_cloud_models:
-        description: 'Pull cloud models (minimax-m3, kimi-k2.7, gemma4, glm-5.2, qwen3:32b)'
+        description: 'Also pull all cloud models (glm-5.2, minimax-m3, kimi-k2.7, nemotron, gemma4 cloud)'
         required: false
         type: choice
         options:
@@ -89,20 +107,17 @@ jobs:
           exit 1
         }
 
-    # Pull the selected model, then write a Modelfile to enforce context size.
-    # IMPORTANT: We write the Modelfile using printf rather than a heredoc.
-    # Heredoc bodies that start at column 0 are seen as YAML document roots
-    # by the GitHub Actions parser and cause "invalid workflow file" errors.
-    # printf keeps all content inside the indented run: scalar, which is safe.
+    # We use printf instead of heredocs to write the Modelfile.
+    # Heredoc bodies at column 0 break the GitHub Actions YAML parser.
     - name: Pull local model and apply custom context
       run: |
         INPUT_MODEL="${{ inputs.local_model }}"
         CTX_SIZE="${{ env.NUM_CTX }}"
 
-        echo "Pulling model: $INPUT_MODEL"
+        echo "Pulling local model: $INPUT_MODEL"
         ollama pull "$INPUT_MODEL"
 
-        # Safe name: ornith:9b -> ornith-9b-ctx32k
+        # Build a safe model name with no colons: ornith:9b -> ornith-9b-ctx32k
         SAFE_NAME=$(echo "$INPUT_MODEL" | tr ':' '-')
         CUSTOM_MODEL="${SAFE_NAME}-ctx32k"
 
@@ -137,16 +152,20 @@ jobs:
           exit 1
         fi
 
+    # Cloud models are pulled one by one. Failures are logged but do not abort
+    # the workflow. Only models that actually pulled successfully are registered
+    # in LiteLLM and written to opencode_config.json.
     - name: Pull cloud models
       if: inputs.use_cloud_models == 'true'
       run: |
         CLOUD_MODELS=(
+          "glm-5.2:cloud"
           "minimax-m3:cloud"
           "kimi-k2.7-code:cloud"
-          "gemma4:12b"
-          "gemma4:27b"
-          "qwen3:32b"
-          "glm-5.2:cloud"
+          "nemotron-3-ultra:cloud"
+          "nemotron-3-super:cloud"
+          "gemma4:e2b"
+          "gemma4:e4b"
         )
         PULLED_CLOUD=""
         for CM in "${CLOUD_MODELS[@]}"; do
@@ -155,12 +174,12 @@ jobs:
             echo "  OK: $CM"
             PULLED_CLOUD="${PULLED_CLOUD},${CM}"
           else
-            echo "  SKIP: $CM (pull failed)"
+            echo "  SKIP: $CM (pull failed - will not be added to config)"
           fi
         done
         PULLED_CLOUD="${PULLED_CLOUD#,}"
         echo "PULLED_CLOUD_MODELS=$PULLED_CLOUD" >> "$GITHUB_ENV"
-        echo "Pulled: $PULLED_CLOUD"
+        echo "Successfully pulled cloud models: $PULLED_CLOUD"
 
     - name: Mark cloud models as disabled
       if: inputs.use_cloud_models != 'true'
@@ -169,8 +188,7 @@ jobs:
     - name: Install LiteLLM
       run: pip install --quiet 'litellm[proxy]'
 
-    # Generate litellm_config.yaml using printf for every line, avoiding
-    # any heredoc that would place content at column 0.
+    # Generate litellm_config.yaml with printf only (no heredocs).
     - name: Generate LiteLLM config
       run: |
         LITELLM_KEY="sk-ghactions-$(openssl rand -hex 16)"
@@ -179,7 +197,6 @@ jobs:
         OLLAMA_BASE="${{ env.OLLAMA_BASE_URL }}"
         CTX_SIZE="${{ env.NUM_CTX }}"
 
-        # Build config line by line with printf - no heredoc needed
         {
           printf 'model_list:\n'
           printf '  - model_name: %s\n' "$MODEL_TO_USE"
@@ -190,7 +207,6 @@ jobs:
           printf '      num_ctx: %s\n' "$CTX_SIZE"
         } > litellm_config.yaml
 
-        # Append one entry per successfully pulled cloud model
         if [ -n "$PULLED_CLOUD_MODELS" ]; then
           IFS=',' read -ra CLOUD_LIST <<< "$PULLED_CLOUD_MODELS"
           for CM in "${CLOUD_LIST[@]}"; do
@@ -205,7 +221,6 @@ jobs:
           done
         fi
 
-        # General settings - again with printf, no heredoc
         {
           printf '\ngeneral_settings:\n'
           printf '  master_key: "%s"\n' "$LITELLM_KEY"
@@ -250,7 +265,7 @@ jobs:
           cat litellm.log
           exit 1
         fi
-        echo "Models in LiteLLM:"
+        echo "Models registered in LiteLLM:"
         echo "$MODELS_JSON" | jq -r '.data[].id'
         if echo "$MODELS_JSON" | jq -r '.data[].id' | grep -qF "$MODEL_TO_USE"; then
           echo "Local model $MODEL_TO_USE confirmed."
@@ -287,28 +302,66 @@ jobs:
         fi
         echo "TUNNEL_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
 
-    # Build opencode_config.json entirely with jq so JSON is always valid.
+    # opencode_config.json is built entirely with jq.
+    # KEY FIXES vs previous version:
+    #   1. "note" key removed - OpenCode schema does not allow it (caused the error)
+    #   2. Cloud model context limits added correctly per model
+    #   3. Model IDs match exactly what LiteLLM registered (display names from tr ':' '-')
+    #   4. No unrecognized keys anywhere in the schema
     - name: Generate OpenCode config
       run: |
         CTX_SIZE="${{ env.NUM_CTX }}"
 
+        # Start with the local model
         MODELS_JSON=$(jq -n \
           --arg id   "$MODEL_TO_USE" \
-          --arg name "Local: $MODEL_TO_USE (32k ctx)" \
+          --arg name "Local: $MODEL_TO_USE" \
           --argjson ctx "$CTX_SIZE" \
-          '{($id): {"id": $id, "name": $name, "tool_call": true, "temperature": true, "limit": {"context": $ctx, "output": 8192}}}')
+          '{
+            ($id): {
+              "id":          $id,
+              "name":        $name,
+              "tool_call":   true,
+              "temperature": true,
+              "limit":       {"context": $ctx, "output": 8192}
+            }
+          }')
 
+        # Add each successfully pulled cloud model with correct context limits
         if [ -n "$PULLED_CLOUD_MODELS" ]; then
           IFS=',' read -ra CLOUD_LIST <<< "$PULLED_CLOUD_MODELS"
           for CM in "${CLOUD_LIST[@]}"; do
             DISPLAY=$(echo "$CM" | tr ':' '-')
+
+            # Set context limit per model based on ollama.com specs
+            case "$CM" in
+              "glm-5.2:cloud")           CTX_LIMIT=976000  ;;
+              "minimax-m3:cloud")        CTX_LIMIT=512000  ;;
+              "kimi-k2.7-code:cloud")    CTX_LIMIT=256000  ;;
+              "nemotron-3-ultra:cloud")  CTX_LIMIT=256000  ;;
+              "nemotron-3-super:cloud")  CTX_LIMIT=256000  ;;
+              "gemma4:e2b")              CTX_LIMIT=128000  ;;
+              "gemma4:e4b")              CTX_LIMIT=128000  ;;
+              *)                         CTX_LIMIT=32768   ;;
+            esac
+
             MODELS_JSON=$(echo "$MODELS_JSON" | jq \
-              --arg id   "$DISPLAY" \
-              --arg name "Cloud: $CM" \
-              '. + {($id): {"id": $id, "name": $name, "tool_call": true, "temperature": true}}')
+              --arg  id    "$DISPLAY" \
+              --arg  name  "Cloud: $CM" \
+              --argjson ctx "$CTX_LIMIT" \
+              '. + {
+                ($id): {
+                  "id":          $id,
+                  "name":        $name,
+                  "tool_call":   true,
+                  "temperature": true,
+                  "limit":       {"context": $ctx, "output": 8192}
+                }
+              }')
           done
         fi
 
+        # Write final config - only keys that OpenCode schema accepts
         jq -n \
           --arg baseURL      "$TUNNEL_URL/v1" \
           --arg apiKey       "$LITELLM_KEY" \
@@ -322,18 +375,23 @@ jobs:
                 "name": "GitHub Actions LiteLLM Proxy",
                 "options": {
                   "baseURL": $baseURL,
-                  "apiKey": $apiKey,
+                  "apiKey":  $apiKey,
                   "timeout": 600000
                 },
                 "models": $models
               }
             },
-            "model": $defaultModel,
-            "note": "Tunnel closes when the GitHub Actions job ends (max ~6 hours)."
+            "model": $defaultModel
           }' > opencode_config.json
 
         echo "opencode_config.json:"
         cat opencode_config.json
+
+        # Sanity check: confirm the JSON is valid
+        jq empty opencode_config.json && echo "JSON is valid." || {
+          echo "ERROR: Generated JSON is invalid."
+          exit 1
+        }
 
     - name: Upload OpenCode config artifact
       uses: actions/upload-artifact@v4
@@ -353,7 +411,9 @@ jobs:
           echo "| Local Model | \`${MODEL_TO_USE}\` |"
           echo "| Cloud Models | \`${PULLED_CLOUD_MODELS:-none}\` |"
           echo ""
-          echo "> Download the **opencode-config** artifact and place it in your project root."
+          echo "> Download the **opencode-config** artifact and place it at:"
+          echo "> - Windows: \`C:\\Users\\<you>\\.opencode\\opencode.json\`"
+          echo "> - Mac/Linux: \`~/.opencode/opencode.json\`"
           echo "> The tunnel closes automatically when this job ends."
         } >> "$GITHUB_STEP_SUMMARY"
 
@@ -363,14 +423,11 @@ jobs:
         echo "  Local model: ${MODEL_TO_USE}"
         echo "============================================"
 
-    # Health-check loop. Wakes every 5 minutes, prints status.
-    # Exits with error and shows logs if Ollama or LiteLLM goes down.
-    # The job's timeout-minutes: 350 is the hard outer limit (~5h50m).
     - name: Keep alive - health monitor
       run: |
         PORT="${{ env.LITELLM_PORT }}"
         echo "Keep-alive started. Job runs up to 350 minutes."
-        echo "Health printed every 5 minutes."
+        echo "Health status printed every 5 minutes."
 
         ITER=0
         while true; do
