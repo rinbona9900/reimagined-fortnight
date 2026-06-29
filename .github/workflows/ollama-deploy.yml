@@ -39,7 +39,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y zstd curl lsof net-tools jq
+        sudo apt-get install -y zstd curl lsof net-tools jq netcat-openbsd
 
     - name: Install Ollama
       run: |
@@ -127,22 +127,6 @@ jobs:
     - name: Install LiteLLM
       run: |
         pip install litellm[proxy]
-
-    - name: Generate LiteLLM config with All Models
-      run: |
-        LITELLM_KEY="sk-ghactions-${RANDOM}-$(openssl rand -hex 16)"
-        echo "LITELLM_KEY=$LITELLM_KEY" >> $GITHUB_ENV
-        
-        # Build model list dynamically
-        cat > litellm_config.yaml << EOF
-        model_list:
-          # Local Fallback Model
-          - model_name: ${MODEL_TO_USE}
-            litellm_params:
-              model: ollama_chat/${MODEL_TO_USE}
-              api_base: http://${{ env.OLLAMA_HOST }}
-              num_ctx: ${{ env.NUM_CTX }}
-              api_key: "ollama-local"
 
     - name: Generate LiteLLM config with All Models
       run: |
