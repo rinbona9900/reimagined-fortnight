@@ -1,18 +1,25 @@
-name: Deploy Ollama + Qwen Coder + Cloudflare Tunnel
+name: Deploy Ollama + Latest Models + Cloudflare Tunnel
 
 on:
   workflow_dispatch:
     inputs:
-      model_tag:
-        description: 'Ollama model tag to use (e.g., qwen2.5-coder:7b, qwen2.5-coder:14b)'
+      use_cloud_models:
+        description: 'Enable cloud models (MiniMax, Kimi, GLM, etc.) alongside local models'
         required: false
-        default: 'qwen2.5-coder:7b'
+        default: 'true'
+      primary_local_model:
+        description: 'Primary local model for fallback (e.g., lfm2.5, north-mini-code-1.0, ornith:9b)'
+        required: false
+        default: 'lfm2.5'
 
 env:
-  PRIMARY_MODEL: ${{ inputs.model_tag || 'qwen2.5-coder:7b' }}
-  CUSTOM_MODEL_NAME: 'qwen-coder-tools'
-  GENERAL_MODEL: 'qwen2.5:7b'
-  LAST_RESORT_MODEL: 'llama3.1:8b'
+  # Latest Cloud Models (Simultaneous)
+  CLOUD_MODELS: "minimax-m3:cloud,kimi-k2.7-code:cloud,gemma4:cloud,qwen3.6:27b,gemma4:12b,gemma4:31b"
+  # Latest Local Models (Optimized for 16GB RAM / 4-Core)
+  PRIMARY_LOCAL: ${{ inputs.primary_local_model || 'lfm2.5' }}
+  FALLBACK_LOCAL_1: 'north-mini-code-1.0'
+  FALLBACK_LOCAL_2: 'ornith:9b'
+  FALLBACK_LOCAL_3: 'phi4:14b'
   NUM_CTX: 32768
   OLLAMA_HOST: '127.0.0.1:11434'
   LITELLM_PORT: 4000
@@ -52,106 +59,124 @@ jobs:
         sleep 5
         sudo systemctl status ollama --no-pager
 
-    - name: Pull primary model
+    - name: Pull Latest Cloud Models (Simultaneous)
+      if: inputs.use_cloud_models == 'true' || inputs.use_cloud_models == ''
       run: |
-        ollama pull ${{ env.PRIMARY_MODEL }}
+        echo "Pulling latest cloud models..."
+        IFS=',' read -ra MODELS <<< "${{ env.CLOUD_MODELS }}"
+        for model in "${MODELS[@]}"; do
+          echo "Pulling $model..."
+          ollama pull $model || echo "Warning: Failed to pull $model"
+        done
+        echo "Cloud models ready."
 
-    - name: Create custom model with tools support
+    - name: Pull Primary Local Model
       run: |
-        cat > Modelfile.tools << EOF
-        FROM ${{ env.PRIMARY_MODEL }}
+        echo "Pulling primary local model: ${{ env.PRIMARY_LOCAL }}"
+        ollama pull ${{ env.PRIMARY_LOCAL }}
 
-        SYSTEM You are a helpful AI assistant with access to tools. CRITICAL FORMAT RULE: When you need to invoke a tool, you MUST respond with a structured tool_calls API call. NEVER wrap tool call JSON inside the content field as plain text. Always use the proper structured tool_calls field on the assistant message.
-
-        PARAMETER num_ctx ${{ env.NUM_CTX }}
-        PARAMETER temperature 0.2
-        PARAMETER repeat_penalty 1.1
-        EOF
-        ollama create ${{ env.CUSTOM_MODEL_NAME }} -f Modelfile.tools
-
-    - name: Verify model tools support
+    - name: Verify Local Model Tool Support
+      id: verify_local
       run: |
-        MODEL_TAG="${{ env.CUSTOM_MODEL_NAME }}"
-        echo "Testing model: $MODEL_TAG"
+        MODEL_TO_USE=""
+        
+        # Test Primary Local
+        echo "Testing ${{ env.PRIMARY_LOCAL }}..."
         PROBE='{
-          "model": "'$MODEL_TAG'",
-          "messages": [
-            {
-              "role": "user",
-              "content": "What'\''s the weather in Paris? Use the get_weather tool."
-            }
-          ],
-          "tools": [
-            {
-              "type": "function",
-              "function": {
-                "name": "get_weather",
-                "description": "Get current weather for a city",
-                "parameters": {
-                  "type": "object",
-                  "properties": {
-                    "city": {
-                      "type": "string"
-                    }
-                  },
-                  "required": ["city"]
-                }
-              }
-            }
-          ],
+          "model": "${{ env.PRIMARY_LOCAL }}",
+          "messages": [{"role": "user", "content": "What'\''s the weather in Paris? Use the get_weather tool."}],
+          "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}],
           "stream": false
         }'
-        
         RESPONSE=$(curl -s -X POST http://localhost:11434/api/chat -H "Content-Type: application/json" -d "$PROBE")
-        echo "Response: $RESPONSE"
-        
         if echo "$RESPONSE" | jq -e '.message.tool_calls' > /dev/null; then
-          echo "Model supports tools correctly."
-          echo "MODEL_TO_USE=$MODEL_TAG" >> $GITHUB_ENV
+          MODEL_TO_USE="${{ env.PRIMARY_LOCAL }}"
+          echo "Primary model $MODEL_TO_USE supports tools."
         else
-          echo "Primary model verification failed. Trying fallback models..."
-          
-          # Fallback: General model
-          echo "Trying ${{ env.GENERAL_MODEL }}"
-          ollama pull ${{ env.GENERAL_MODEL }}
-          PROBE_GENERAL=$(echo "$PROBE" | sed "s/${{ env.CUSTOM_MODEL_NAME }}/${{ env.GENERAL_MODEL }}/g")
-          RESPONSE=$(curl -s -X POST http://localhost:11434/api/chat -H "Content-Type: application/json" -d "$PROBE_GENERAL")
+          echo "Primary failed. Trying ${{ env.FALLBACK_LOCAL_1 }}..."
+          ollama pull ${{ env.FALLBACK_LOCAL_1 }}
+          PROBE=$(echo "$PROBE" | sed "s/${{ env.PRIMARY_LOCAL }}/${{ env.FALLBACK_LOCAL_1 }}/g")
+          RESPONSE=$(curl -s -X POST http://localhost:11434/api/chat -H "Content-Type: application/json" -d "$PROBE")
           if echo "$RESPONSE" | jq -e '.message.tool_calls' > /dev/null; then
-            echo "Model supports tools correctly."
-            echo "MODEL_TO_USE=${{ env.GENERAL_MODEL }}" >> $GITHUB_ENV
+            MODEL_TO_USE="${{ env.FALLBACK_LOCAL_1 }}"
           else
-            # Fallback: Last resort model
-            echo "Trying ${{ env.LAST_RESORT_MODEL }}"
-            ollama pull ${{ env.LAST_RESORT_MODEL }}
-            PROBE_LAST=$(echo "$PROBE" | sed "s/${{ env.CUSTOM_MODEL_NAME }}/${{ env.LAST_RESORT_MODEL }}/g")
-            RESPONSE=$(curl -s -X POST http://localhost:11434/api/chat -H "Content-Type: application/json" -d "$PROBE_LAST")
+            echo "Fallback 1 failed. Trying ${{ env.FALLBACK_LOCAL_2 }}..."
+            ollama pull ${{ env.FALLBACK_LOCAL_2 }}
+            PROBE=$(echo "$PROBE" | sed "s/${{ env.FALLBACK_LOCAL_1 }}/${{ env.FALLBACK_LOCAL_2 }}/g")
+            RESPONSE=$(curl -s -X POST http://localhost:11434/api/chat -H "Content-Type: application/json" -d "$PROBE")
             if echo "$RESPONSE" | jq -e '.message.tool_calls' > /dev/null; then
-              echo "Model supports tools correctly."
-              echo "MODEL_TO_USE=${{ env.LAST_RESORT_MODEL }}" >> $GITHUB_ENV
+              MODEL_TO_USE="${{ env.FALLBACK_LOCAL_2 }}"
             else
-              echo "No model supports tools correctly."
-              exit 1
+              echo "Fallback 2 failed. Trying ${{ env.FALLBACK_LOCAL_3 }}..."
+              ollama pull ${{ env.FALLBACK_LOCAL_3 }}
+              PROBE=$(echo "$PROBE" | sed "s/${{ env.FALLBACK_LOCAL_2 }}/${{ env.FALLBACK_LOCAL_3 }}/g")
+              RESPONSE=$(curl -s -X POST http://localhost:11434/api/chat -H "Content-Type: application/json" -d "$PROBE")
+              if echo "$RESPONSE" | jq -e '.message.tool_calls' > /dev/null; then
+                MODEL_TO_USE="${{ env.FALLBACK_LOCAL_3 }}"
+              else
+                echo "All local models failed tool support check."
+                exit 1
+              fi
             fi
           fi
         fi
+        
+        echo "MODEL_TO_USE=$MODEL_TO_USE" >> $GITHUB_ENV
+        echo "Selected local model: $MODEL_TO_USE"
 
     - name: Install LiteLLM
       run: |
         pip install litellm[proxy]
 
-    - name: Generate LiteLLM config
+    - name: Generate LiteLLM config with All Models
       run: |
         LITELLM_KEY="sk-ghactions-${RANDOM}-$(openssl rand -hex 16)"
         echo "LITELLM_KEY=$LITELLM_KEY" >> $GITHUB_ENV
         
+        # Build model list dynamically
         cat > litellm_config.yaml << EOF
         model_list:
-          - model_name: qwen
+          # Local Fallback Model
+          - model_name: ${MODEL_TO_USE}
             litellm_params:
-              model: ollama_chat/${{ env.MODEL_TO_USE }}
+              model: ollama_chat/${MODEL_TO_USE}
               api_base: http://${{ env.OLLAMA_HOST }}
               num_ctx: ${{ env.NUM_CTX }}
               api_key: "ollama-local"
+EOF
+
+        # Add cloud models if enabled
+        if [ "${{ inputs.use_cloud_models }}" == "true" ] || [ -z "${{ inputs.use_cloud_models }}" ]; then
+          cat >> litellm_config.yaml << EOF
+          - model_name: minimax-m3
+            litellm_params:
+              model: ollama_chat/minimax-m3:cloud
+              api_base: http://${{ env.OLLAMA_HOST }}
+              api_key: "ollama-cloud"
+          - model_name: kimi-k2.7-code
+            litellm_params:
+              model: ollama_chat/kimi-k2.7-code:cloud
+              api_base: http://${{ env.OLLAMA_HOST }}
+              api_key: "ollama-cloud"
+          - model_name: gemma4-12b
+            litellm_params:
+              model: ollama_chat/gemma4:12b
+              api_base: http://${{ env.OLLAMA_HOST }}
+              api_key: "ollama-cloud"
+          - model_name: gemma4-31b
+            litellm_params:
+              model: ollama_chat/gemma4:31b
+              api_base: http://${{ env.OLLAMA_HOST }}
+              api_key: "ollama-cloud"
+          - model_name: qwen3.6-27b
+            litellm_params:
+              model: ollama_chat/qwen3.6:27b
+              api_base: http://${{ env.OLLAMA_HOST }}
+              api_key: "ollama-cloud"
+EOF
+        fi
+
+        cat >> litellm_config.yaml << EOF
 
         general_settings:
           master_key: "$LITELLM_KEY"
@@ -161,46 +186,24 @@ jobs:
           set_tool_choice_to_always: false
           telemetry: false
           request_timeout: 600
-        EOF
+EOF
+        echo "LiteLLM config generated with models: ${MODEL_TO_USE} + cloud models"
 
     - name: Start LiteLLM proxy
       run: |
         litellm --config litellm_config.yaml --port ${{ env.LITELLM_PORT }} &
         sleep 10
-        # Check if LiteLLM started
         if ! nc -z localhost ${{ env.LITELLM_PORT }}; then
           echo "LiteLLM failed to start"
           exit 1
         fi
 
-    - name: Test LiteLLM proxy
+    - name: Test LiteLLM proxy with local model
       run: |
         PROXY_PROBE='{
-          "model": "qwen",
-          "messages": [
-            {
-              "role": "user",
-              "content": "What'\''s the weather in Tokyo? Use the get_weather tool."
-            }
-          ],
-          "tools": [
-            {
-              "type": "function",
-              "function": {
-                "name": "get_weather",
-                "description": "Get current weather for a city",
-                "parameters": {
-                  "type": "object",
-                  "properties": {
-                    "city": {
-                      "type": "string"
-                    }
-                  },
-                  "required": ["city"]
-                }
-              }
-            }
-          ]
+          "model": "${{ env.MODEL_TO_USE }}",
+          "messages": [{"role": "user", "content": "What'\''s the weather in Tokyo? Use the get_weather tool."}],
+          "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
         }'
         
         RESPONSE=$(curl -s -X POST http://localhost:${{ env.LITELLM_PORT }}/v1/chat/completions \
@@ -211,7 +214,7 @@ jobs:
         echo "Proxy test response: $RESPONSE"
         
         if echo "$RESPONSE" | jq -e '.choices[0].message.tool_calls' > /dev/null; then
-          echo "LiteLLM proxy works correctly."
+          echo "LiteLLM proxy works correctly with ${{ env.MODEL_TO_USE }}."
         else
           echo "LiteLLM proxy test failed."
           exit 1
@@ -240,10 +243,11 @@ jobs:
         echo "=== DEPLOYMENT COMPLETE ==="
         echo "Base URL: ${{ env.TUNNEL_URL }}/v1"
         echo "API Key: ${{ env.LITELLM_KEY }}"
-        echo "Model: ${{ env.MODEL_TO_USE }}"
+        echo "Local Model: ${{ env.MODEL_TO_USE }}"
+        echo "Cloud Models: minimax-m3, kimi-k2.7-code, gemma4, qwen3.6 (if enabled)"
         echo "Context: ${{ env.NUM_CTX }}"
         
-        # Generate OpenCode config
+        # Generate OpenCode config with all models
         cat > opencode_config.json << EOF
         {
           "\$schema": "https://opencode.ai/config.json",
@@ -257,28 +261,52 @@ jobs:
                 "timeout": 600000
               },
               "models": {
-                "qwen": {
-                  "id": "qwen",
-                  "name": "Qwen 2.5 Coder (${{ env.MODEL_TO_USE }})",
+                "${{ env.MODEL_TO_USE }}": {
+                  "id": "${{ env.MODEL_TO_USE }}",
+                  "name": "Local Fallback (${{ env.MODEL_TO_USE }})",
                   "tool_call": true,
                   "temperature": true,
-                  "limit": {
-                    "context": ${{ env.NUM_CTX }},
-                    "output": 8192
-                  },
-                  "options": {
-                    "temperature": 0.2,
-                    "top_p": 0.95,
-                    "num_ctx": ${{ env.NUM_CTX }},
-                    "repeat_penalty": 1.1
-                  }
+                  "limit": {"context": ${{ env.NUM_CTX }}, "output": 8192},
+                  "options": {"temperature": 0.2, "top_p": 0.95, "num_ctx": ${{ env.NUM_CTX }}}
+                },
+                "minimax-m3": {
+                  "id": "minimax-m3",
+                  "name": "MiniMax M3 (Cloud)",
+                  "tool_call": true,
+                  "temperature": true,
+                  "limit": {"context": 1000000, "output": 8192}
+                },
+                "kimi-k2.7-code": {
+                  "id": "kimi-k2.7-code",
+                  "name": "Kimi K2.7 Code (Cloud)",
+                  "tool_call": true,
+                  "temperature": true,
+                  "limit": {"context": 256000, "output": 8192}
+                },
+                "gemma4-12b": {
+                  "id": "gemma4-12b",
+                  "name": "Gemma 4 12B (Cloud)",
+                  "tool_call": true,
+                  "temperature": true
+                },
+                "gemma4-31b": {
+                  "id": "gemma4-31b",
+                  "name": "Gemma 4 31B (Cloud)",
+                  "tool_call": true,
+                  "temperature": true
+                },
+                "qwen3.6-27b": {
+                  "id": "qwen3.6-27b",
+                  "name": "Qwen 3.6 27B (Cloud)",
+                  "tool_call": true,
+                  "temperature": true
                 }
               }
             }
           },
-          "model": "gh-actions-backend/qwen"
+          "model": "gh-actions-backend/${{ env.MODEL_TO_USE }}"
         }
-        EOF
+EOF
         
         echo "OpenCode Config:"
         cat opencode_config.json
@@ -289,9 +317,8 @@ jobs:
         name: opencode-config
         path: opencode_config.json
 
-    - name: Keep alive and monitor (loop placeholder)
+    - name: Keep alive and monitor
       run: |
         echo "Monitoring services..."
-        # In a real long-running scenario, you would implement a monitoring loop here
-        # Note: GitHub Actions has a maximum runtime limit per job (typically 6 hours)
-        # For continuous operation, consider using a self-hosted runner or external service
+        echo "Available models: ${{ env.MODEL_TO_USE }} (local), minimax-m3, kimi-k2.7-code, gemma4, qwen3.6 (cloud)"
+        sleep 300
