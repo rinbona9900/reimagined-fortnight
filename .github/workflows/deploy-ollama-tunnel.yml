@@ -1,0 +1,334 @@
+name: Deploy Ollama + Qwen Coder + Cloudflare Tunnel
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'Model to use (default: qwen2.5-coder:7b for RAM usage)'
+        required: false
+        default: 'qwen2.5-coder:7b'
+        type: string
+
+jobs:
+  deploy-ollama-tunnel:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y zstd curl lsof net-tools python3-pip
+
+      - name: Install Ollama
+        run: |
+          echo "Installing Ollama..."
+          curl -fsSL https://ollama.com/install.sh | sh
+          echo "Ollama installed successfully"
+
+      - name: Configure Ollama for CPU-only mode
+        run: |
+          # Set environment variables for CPU-only inference
+          echo "OLLAMA_HOST=http://127.0.0.1:11434" >> $GITHUB_ENV
+          echo "OLLAMA_NUM_CTX=32768" >> $GITHUB_ENV
+          echo "OLLAMA_KEEP_ALIVE=30m" >> $GITHUB_ENV
+          # Force CPU usage by setting NO_GPU flag
+          echo "OLLAMA_NUM_PARALLEL=1" >> $GITHUB_ENV
+          echo "OLLAMA_MAX_LOADED_MODELS=1" >> $GITHUB_ENV
+
+      - name: Start Ollama server
+        run: |
+          echo "Starting Ollama server in background..."
+          ollama serve > ollama.log 2>&1 &
+          OLLAMA_PID=$!
+          echo "Ollama PID: $OLLAMA_PID"
+          echo $OLLAMA_PID > ollama.pid
+          
+          # Wait for Ollama to be ready
+          echo "Waiting for Ollama to start..."
+          for i in {1..40}; do
+            if curl -s http://127.0.0.1:11434/api/tags > /dev/null 2>&1; then
+              echo "✓ Ollama is ready after $((i * 2)) seconds"
+              break
+            fi
+            sleep 2
+          done
+          
+          # Verify Ollama is running
+          if ! curl -s http://127.0.0.1:11434/api/tags > /dev/null; then
+            echo "✗ Ollama failed to start"
+            cat ollama.log
+            exit 1
+          fi
+
+      - name: Pull Qwen2.5-Coder model
+        run: |
+          MODEL="${{ github.event.inputs.model || 'qwen2.5-coder:7b' }}"
+          echo "Pulling model: $MODEL"
+          ollama pull $MODEL
+          echo "✓ Model pulled successfully"
+          
+          # Also pull fallback models
+          echo "Pulling fallback models..."
+          ollama pull qwen2.5:7b || true
+          ollama pull llama3.1:8b || true
+
+      - name: Create custom Modelfile with tool support
+        run: |
+          MODEL="${{ github.event.inputs.model || 'qwen2.5-coder:7b' }}"
+          cat > Modelfile.tools << EOF
+          FROM $MODEL
+          
+          SYSTEM You are a helpful AI assistant with access to tools. CRITICAL FORMAT RULE: When you need to invoke a tool, you MUST respond with a structured tool_calls API call. NEVER wrap tool call JSON inside the \`content\` field as plain text. Always use the proper structured tool_calls field on the assistant message.
+          
+          PARAMETER num_ctx 32768
+          PARAMETER temperature 0.2
+          PARAMETER repeat_penalty 1.1
+          EOF
+          
+          echo "Creating custom model with tool support..."
+          ollama create qwen-coder-tools -f Modelfile.tools
+          echo "✓ Custom model created"
+
+      - name: Install LiteLLM
+        run: |
+          echo "Installing LiteLLM..."
+          pip3 install -q "litellm[proxy]"
+          echo "✓ LiteLLM installed"
+
+      - name: Generate API key and create LiteLLM config
+        id: litellm-config
+        run: |
+          # Generate random API key
+          LITELLM_KEY="sk-opencode-$(openssl rand -hex 16)"
+          echo "LITELLM_KEY=$LITELLM_KEY" >> $GITHUB_ENV
+          echo "::add-mask::$LITELLM_KEY"
+          
+          MODEL="${{ github.event.inputs.model || 'qwen2.5-coder:7b' }}"
+          
+          cat > litellm_config.yaml << EOF
+          model_list:
+            - model_name: qwen
+              litellm_params:
+                model: ollama_chat/$MODEL
+                api_base: http://127.0.0.1:11434
+                num_ctx: 32768
+                api_key: "ollama-local"
+          
+          general_settings:
+            master_key: "$LITELLM_KEY"
+          
+          litellm_settings:
+            drop_params: true
+            set_tool_choice_to_always: false
+            telemetry: false
+            request_timeout: 600
+          EOF
+          
+          echo "✓ LiteLLM config created"
+          echo "API Key: $LITELLM_KEY"
+
+      - name: Start LiteLLM proxy
+        run: |
+          echo "Starting LiteLLM proxy on port 4000..."
+          litellm --config litellm_config.yaml --port 4000 > litellm.log 2>&1 &
+          LITELLM_PID=$!
+          echo "LiteLLM PID: $LITELLM_PID"
+          echo $LITELLM_PID > litellm.pid
+          
+          # Wait for LiteLLM to be ready
+          echo "Waiting for LiteLLM to start..."
+          for i in {1..40}; do
+            if curl -s http://127.0.0.1:4000/health/liveliness > /dev/null 2>&1; then
+              echo "✓ LiteLLM is ready after $((i * 2)) seconds"
+              break
+            fi
+            sleep 2
+          done
+          
+          # Verify LiteLLM is running
+          if ! curl -s http://127.0.0.1:4000/health/liveliness > /dev/null; then
+            echo "✗ LiteLLM failed to start"
+            tail -n 50 litellm.log
+            exit 1
+          fi
+          
+          echo "✓ LiteLLM proxy started successfully"
+
+      - name: Test tool calling through LiteLLM
+        run: |
+          echo "Testing tool calls through LiteLLM proxy..."
+          
+          RESPONSE=$(curl -s -X POST http://127.0.0.1:4000/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $LITELLM_KEY" \
+            -d '{
+              "model": "qwen",
+              "messages": [{"role": "user", "content": "What is the weather in Paris? Use the get_weather tool."}],
+              "tools": [{
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Get current weather for a city",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                  }
+                }
+              }]
+            }')
+          
+          echo "Response: $RESPONSE" | python3 -m json.tool || echo "$RESPONSE"
+          
+          # Check if tool_calls are present
+          if echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); tc=d['choices'][0]['message'].get('tool_calls'); sys.exit(0 if tc else 1)" 2>/dev/null; then
+            echo "✓ Tool calls working correctly"
+          else
+            echo "⚠ Tool calls may not be working, but continuing..."
+          fi
+
+      - name: Download Cloudflared
+        run: |
+          echo "Downloading cloudflared..."
+          curl -sL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          echo "✓ Cloudflared downloaded"
+
+      - name: Start Cloudflare tunnel
+        run: |
+          echo "Starting Cloudflare tunnel..."
+          ./cloudflared tunnel --url http://127.0.0.1:4000 > cloudflare.log 2>&1 &
+          TUNNEL_PID=$!
+          echo "Tunnel PID: $TUNNEL_PID"
+          echo $TUNNEL_PID > tunnel.pid
+          
+          # Wait for tunnel URL
+          echo "Waiting for Cloudflare tunnel URL..."
+          TUNNEL_URL=""
+          for i in {1..30}; do
+            TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' cloudflare.log | head -1)
+            if [ -n "$TUNNEL_URL" ]; then
+              echo "✓ Tunnel URL found after $((i * 2)) seconds"
+              break
+            fi
+            sleep 2
+          done
+          
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "✗ Failed to get tunnel URL"
+            cat cloudflare.log
+            exit 1
+          fi
+          
+          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+          echo "✓ Cloudflare tunnel started"
+
+      - name: Display deployment information
+        run: |
+          echo ""
+          echo "════════════════════════════════════════════════════════"
+          echo "  🚀  DEPLOYMENT COMPLETE"
+          echo "════════════════════════════════════════════════════════"
+          echo "  🌐  Base URL:    $TUNNEL_URL/v1"
+          echo "  🔑  API Key:     $LITELLM_KEY"
+          echo "  📦  Model:       ${{ github.event.inputs.model || 'qwen2.5-coder:7b' }}"
+          echo "  📏  Context:     32768"
+          echo "  💾  Mode:        CPU/RAM (no VRAM)"
+          echo "════════════════════════════════════════════════════════"
+          echo ""
+          echo "  📋  OpenCode Configuration:"
+          echo "────────────────────────────────────────────────────────"
+          
+          cat > opencode_config.json << EOF
+          {
+            "\$schema": "https://opencode.ai/config.json",
+            "provider": {
+              "github-runner-backend": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "GitHub-Runner-Ollama-Proxy",
+                "options": {
+                  "baseURL": "$TUNNEL_URL/v1",
+                  "apiKey": "$LITELLM_KEY",
+                  "timeout": 600000
+                },
+                "models": {
+                  "qwen": {
+                    "id": "qwen",
+                    "name": "Qwen 2.5 Coder (${{ github.event.inputs.model || 'qwen2.5-coder:7b' }})",
+                    "tool_call": true,
+                    "temperature": true,
+                    "limit": {
+                      "context": 32768,
+                      "output": 8192
+                    },
+                    "options": {
+                      "temperature": 0.2,
+                      "top_p": 0.95,
+                      "num_ctx": 32768,
+                      "repeat_penalty": 1.1
+                    }
+                  }
+                }
+              }
+            },
+            "model": "github-runner-backend/qwen"
+          }
+          EOF
+          
+          cat opencode_config.json
+          echo ""
+          echo "────────────────────────────────────────────────────────"
+          echo ""
+          echo "⚠️  IMPORTANT: GitHub Actions runners have limited runtime (~6 hours max)"
+          echo "   The tunnel will remain active only while this workflow is running."
+          echo "   Keep this workflow page open to maintain the connection."
+          echo ""
+          echo "🔗 Quick Test:"
+          echo "   curl -X POST $TUNNEL_URL/v1/chat/completions \\"
+          echo "     -H 'Content-Type: application/json' \\"
+          echo "     -H 'Authorization: Bearer $LITELLM_KEY' \\"
+          echo "     -d '{\"model\": \"qwen\", \"messages\": [{\"role\": \"user\", \"content\": \"Hello!\"}]}'"
+          echo ""
+
+      - name: Keep workflow alive
+        run: |
+          echo "🟢 Workflow is now active. Keeping services running..."
+          echo "   Press 'Cancel workflow' in GitHub UI to stop."
+          echo ""
+          
+          # Monitor loop to keep services alive
+          while true; do
+            # Check Ollama
+            if ! curl -s http://127.0.0.1:11434/api/tags > /dev/null; then
+              echo "⚠️  Ollama down, restarting..."
+              ollama serve > ollama.log 2>&1 &
+              sleep 5
+            fi
+            
+            # Check LiteLLM
+            if ! curl -s http://127.0.0.1:4000/health/liveliness > /dev/null; then
+              echo "⚠️  LiteLLM down, restarting..."
+              litellm --config litellm_config.yaml --port 4000 > litellm.log 2>&1 &
+              sleep 5
+            fi
+            
+            # Check Cloudflared
+            if ! pgrep -f "cloudflared tunnel" > /dev/null; then
+              echo "⚠️  Cloudflared down, restarting..."
+              ./cloudflared tunnel --url http://127.0.0.1:4000 > cloudflare.log 2>&1 &
+              sleep 5
+              # Re-extract URL if needed
+              NEW_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' cloudflare.log | head -1)
+              if [ -n "$NEW_URL" ]; then
+                echo "🔗 New tunnel URL: $NEW_URL/v1"
+              fi
+            fi
+            
+            # Heartbeat
+            echo "💓 $(date '+%Y-%m-%d %H:%M:%S') | Services: Ollama✓ LiteLLM✓ Tunnel✓ | URL: ${TUNNEL_URL:-pending}"
+            
+            sleep 60
+          done

@@ -1,4 +1,2 @@
-```
 # CI/CD
-.github/
-```
+# .github/  # Uncomment if you don't want to track workflows
