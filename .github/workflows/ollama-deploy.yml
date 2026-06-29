@@ -113,12 +113,14 @@ jobs:
           exit 1
         fi
         # NOTE: Ollama stores credentials at ~/.ollama/.ollama/credentials
-        # (the inner .ollama/ is a real subdirectory, not a hidden file trick)
+        # (the inner .ollama/ is a real subdirectory, not a hidden file trick).
+        # File must be JSON: {"token":"..."}  - not a raw token string.
         mkdir -p "$HOME/.ollama/.ollama"
-        printf '%s' "$CLOUD_KEY" > "$HOME/.ollama/.ollama/credentials"
+        printf '%s' "{\"token\":\"$CLOUD_KEY\"}" > "$HOME/.ollama/.ollama/credentials"
         chmod 600 "$HOME/.ollama/.ollama/credentials"
         echo "Wrote credentials to $HOME/.ollama/.ollama/credentials"
         ls -la "$HOME/.ollama/.ollama/"
+        echo "First 40 chars (masked): $(head -c 40 "$HOME/.ollama/.ollama/credentials")..."
         echo "Ollama Cloud credentials installed."
 
     - name: Install Ollama
