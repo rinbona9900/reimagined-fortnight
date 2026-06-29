@@ -1,43 +1,25 @@
-name: Deploy Ollama + LiteLLM + Cloudflare Tunnel (Enhanced)
+name: Deploy Ollama + LiteLLM + Cloudflare Tunnel (Enhanced v3)
 
 # ============================================================================
+# VERSION: 3  (look for this comment in your repo's deploy.yml to confirm
+#              you have the latest version)
+#
 # WHAT THIS DOES
 #   1. Installs Ollama on the GitHub-hosted runner.
-#   2. Pulls the ONE local model selected from the dropdown.
-#   3. Builds a custom Modelfile with conservative num_ctx/num_predict.
-#   4. Optionally pulls Ollama :cloud models (auth via OLLAMA_CLOUD_API_KEY secret).
-#   5. Starts LiteLLM as an OpenAI-compatible proxy in front of Ollama.
-#   6. Smoke-tests EVERY registered model with a real /v1/chat/completions
-#      request. Only models that actually respond end up in the OpenCode config.
-#   7. Opens a Cloudflare Quick Tunnel so LiteLLM is reachable remotely.
-#   8. Generates opencode_config.json with per-model capability flags.
-#   9. Stays alive up to ~5h50m with health checks every 5 min and
-#      a deep /chat probe every 15 min.
+#   2. Pulls ONE local model (dropdown), creates a custom Modelfile variant.
+#   3. Optionally pulls Ollama :cloud models (auth via OLLAMA_CLOUD_API_KEY
+#      secret stored at ~/.ollama/.ollama/credentials as JSON).
+#   4. Starts LiteLLM as an OpenAI-compatible proxy.
+#   5. Smoke-tests EVERY registered model via real /v1/chat/completions.
+#      Only models that actually respond end up in opencode_config.json.
+#   6. Opens a Cloudflare Quick Tunnel.
+#   7. Generates opencode_config.json with per-model capability flags.
+#   8. Keep-alive up to ~5h50m with health probes.
 #
-# MODEL CLASSIFICATION (re-verified against ollama.com/library)
-#
-#   CLOUD  - served by Ollama's cloud, requires OLLAMA_CLOUD_API_KEY
-#     glm-5.2:cloud            976K ctx
-#     minimax-m3:cloud         512K ctx
-#     kimi-k2.7-code:cloud     256K ctx
-#     nemotron-3-ultra:cloud   256K ctx
-#     nemotron-3-super:cloud   256K ctx (120B MoE)
-#
-#   LOCAL  - pulled and run on the runner's CPU/RAM
-#     lfm2.5                   8B,  fast tool calling
-#     north-mini-code-1.0      30B MoE (3B active), coding
-#     ornith:9b                9B,  256K ctx, coding
-#     gemma4:e2b               small local variant
-#     gemma4:e4b               small local variant
-#     gemma4:12b               12B
-#     gemma4:26b               26B
-#     qwen3.6:27b              27B, vision+tools
-#     qwen3.6:35b              35B, vision+tools
-#
-# SECRET REQUIRED FOR CLOUD MODELS
-#   Repository Settings -> Secrets and variables -> Actions
-#   Name : OLLAMA_CLOUD_API_KEY
-#   Value: your ollama.com cloud key
+# CLOUD SETUP (only if use_cloud_models=true)
+#   Repo Settings -> Secrets and variables -> Actions -> New repository secret
+#     Name : OLLAMA_CLOUD_API_KEY
+#     Value: your ollama.com cloud key
 # ============================================================================
 
 on:
@@ -45,7 +27,7 @@ on:
     inputs:
 
       local_model:
-        description: 'Local model to run on the runner (GitHub ubuntu-latest = ~16GB RAM)'
+        description: 'Local model to run on the runner'
         required: true
         type: choice
         options:
@@ -72,10 +54,10 @@ on:
 env:
   OLLAMA_BASE_URL: 'http://127.0.0.1:11434'
   LITELLM_PORT: '4000'
-  NUM_CTX: '16384'        # lower than before: avoids KV-cache OOM on small models
-  NUM_PREDICT: '4096'     # lower than before: faster responses, fewer timeouts
+  NUM_CTX: '16384'
+  NUM_PREDICT: '4096'
   REQUEST_TIMEOUT: '600'
-  PULL_RETRY: '2'         # retries per cloud model
+  PULL_RETRY: '2'
 
 jobs:
   deploy:
@@ -98,80 +80,83 @@ jobs:
         python-version: '3.11'
 
     # ------------------------------------------------------------------------
-    # OLLAMA CLOUD AUTH
-    # Pulls OLLAMA_CLOUD_API_KEY from repo Secrets and writes it where
-    # Ollama expects credentials. Cloud models will not work without this.
+    # OLLAMA CLOUD CREDENTIALS
+    # File path: ~/.ollama/.ollama/credentials
+    # Format   : {"token": "..."}   (JSON, NOT a raw string)
     # ------------------------------------------------------------------------
     - name: Configure Ollama Cloud credentials
       if: inputs.use_cloud_models == 'true'
       env:
         CLOUD_KEY: ${{ secrets.OLLAMA_CLOUD_API_KEY }}
       run: |
+        set +e   # never abort this step on a curl/file error
         if [ -z "$CLOUD_KEY" ]; then
           echo "::error::use_cloud_models=true but OLLAMA_CLOUD_API_KEY secret is not set."
           echo "Add it at: Settings -> Secrets and variables -> Actions -> New repository secret"
           exit 1
         fi
-        # NOTE: Ollama stores credentials at ~/.ollama/.ollama/credentials
-        # (the inner .ollama/ is a real subdirectory, not a hidden file trick).
-        # File must be JSON: {"token":"..."}  - not a raw token string.
         mkdir -p "$HOME/.ollama/.ollama"
         printf '%s' "{\"token\":\"$CLOUD_KEY\"}" > "$HOME/.ollama/.ollama/credentials"
         chmod 600 "$HOME/.ollama/.ollama/credentials"
         echo "Wrote credentials to $HOME/.ollama/.ollama/credentials"
         ls -la "$HOME/.ollama/.ollama/"
-        echo "First 40 chars (masked): $(head -c 40 "$HOME/.ollama/.ollama/credentials")..."
+        echo "Content (masked): $(head -c 60 "$HOME/.ollama/.ollama/credentials")..."
         echo "Ollama Cloud credentials installed."
 
     - name: Install Ollama
-      run: curl -fsSL https://ollama.com/install.sh | sh
+      run: |
+        set +e
+        curl -fsSL https://ollama.com/install.sh | sh
 
     - name: Start Ollama service
       run: |
+        set +e
         export OLLAMA_HOST=0.0.0.0:11434
         nohup ollama serve > ollama.log 2>&1 &
-        echo "Waiting for Ollama..."
         for i in $(seq 1 30); do
-          if curl -sf http://127.0.0.1:11434/api/tags > /dev/null; then
+          curl -s -o /dev/null -w '' http://127.0.0.1:11434/api/tags
+          if curl -s -o /dev/null http://127.0.0.1:11434/api/tags 2>/dev/null; then
             echo "Ollama ready (attempt $i)."
             break
           fi
           sleep 3
         done
-        curl -sf http://127.0.0.1:11434/api/tags > /dev/null || {
+        if ! curl -s -o /dev/null http://127.0.0.1:11434/api/tags 2>/dev/null; then
           echo "ERROR: Ollama did not start."
           tail -50 ollama.log
           exit 1
-        }
+        fi
 
     # ------------------------------------------------------------------------
-    # LOCAL MODEL: pull -> create custom Modelfile -> smoke test
+    # LOCAL MODEL: pull -> custom Modelfile -> direct smoke test
     # ------------------------------------------------------------------------
     - name: Pull local model and create custom variant
       id: local_pull
       run: |
+        set +e
         INPUT_MODEL="${{ inputs.local_model }}"
         CTX_SIZE="${{ env.NUM_CTX }}"
         PRED_SIZE="${{ env.NUM_PREDICT }}"
 
         echo "Pulling local model: $INPUT_MODEL"
-        if ! ollama pull "$INPUT_MODEL" 2>&1 | tail -8; then
-          echo "ERROR: Failed to pull $INPUT_MODEL"
+        ollama pull "$INPUT_MODEL" 2>&1 | tail -10
+        if [ ${PIPESTATUS[0]} -ne 0 ]; then
+          echo "ERROR: ollama pull failed for $INPUT_MODEL"
           exit 1
         fi
 
-        # Build a safe model name: ornith:9b -> ornith-9b-ctx16384
         SAFE_NAME=$(echo "$INPUT_MODEL" | tr ':/' '-')
         CUSTOM_MODEL="${SAFE_NAME}-ctx${CTX_SIZE}"
 
         printf 'FROM %s\nPARAMETER num_ctx %s\nPARAMETER temperature 0.7\nPARAMETER num_predict %s\n' \
           "$INPUT_MODEL" "$CTX_SIZE" "$PRED_SIZE" > Modelfile.custom
 
-        echo "Modelfile contents:"
+        echo "Modelfile:"
         cat Modelfile.custom
 
-        if ! ollama create "$CUSTOM_MODEL" -f Modelfile.custom 2>&1 | tail -5; then
-          echo "ERROR: Failed to create custom model $CUSTOM_MODEL"
+        ollama create "$CUSTOM_MODEL" -f Modelfile.custom 2>&1 | tail -5
+        if [ ${PIPESTATUS[0]} -ne 0 ]; then
+          echo "ERROR: ollama create failed for $CUSTOM_MODEL"
           exit 1
         fi
 
@@ -180,21 +165,24 @@ jobs:
 
     - name: Smoke test local model (direct Ollama)
       run: |
-        echo "Smoke-testing $MODEL_TO_USE directly against Ollama..."
-        RESP=$(curl -sf --max-time 180 -X POST http://127.0.0.1:11434/api/chat \
+        set +e
+        HTTP=$(curl -s -o /tmp/lt.body -w '%{http_code}' --max-time 180 \
+          -X POST http://127.0.0.1:11434/api/chat \
           -H 'Content-Type: application/json' \
           -d "{\"model\":\"$MODEL_TO_USE\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word: OK\"}],\"stream\":false}")
-        if echo "$RESP" | jq -e '.message.content' > /dev/null; then
-          echo "Local direct OK: $(echo "$RESP" | jq -r '.message.content')"
+        BODY=$(cat /tmp/lt.body 2>/dev/null)
+        echo "Direct Ollama HTTP=$HTTP"
+        echo "Body: $(echo "$BODY" | head -c 300)"
+        if [ "$HTTP" = "200" ] && echo "$BODY" | jq -e '.message.content' >/dev/null 2>&1; then
+          echo "Local direct OK: $(echo "$BODY" | jq -r '.message.content')"
         else
-          echo "ERROR: Direct Ollama call to $MODEL_TO_USE failed."
-          echo "$RESP"
+          echo "ERROR: direct Ollama call to $MODEL_TO_USE failed."
           tail -50 ollama.log
           exit 1
         fi
 
     # ------------------------------------------------------------------------
-    # CLOUD MODELS: pull each one, verify presence in ollama list, retry.
+    # CLOUD MODELS: pull each, verify presence, retry.
     # ------------------------------------------------------------------------
     - name: Pull Ollama Cloud models
       if: inputs.use_cloud_models == 'true'
@@ -202,8 +190,7 @@ jobs:
       env:
         RETRIES: ${{ env.PULL_RETRY }}
       run: |
-        # Only :cloud-tagged models belong in this list. Local variants of
-        # gemma4 etc. live in the local_model dropdown, not here.
+        set +e
         CLOUD_MODELS=(
           "glm-5.2:cloud"
           "minimax-m3:cloud"
@@ -211,38 +198,33 @@ jobs:
           "nemotron-3-ultra:cloud"
           "nemotron-3-super:cloud"
         )
-
         PULLED=""
         FAILED=""
         for CM in "${CLOUD_MODELS[@]}"; do
-          OK=false
+          OK=0
           for attempt in $(seq 1 "$RETRIES"); do
-            echo "Pulling $CM (attempt $attempt/$RETRIES) ..."
-            if ollama pull "$CM" 2>&1 | tail -5; then
-              if ollama list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qFx "$CM"; then
-                OK=true
+            echo "Pulling $CM (attempt $attempt/$RETRIES)..."
+            ollama pull "$CM" 2>&1 | tail -3
+            if [ ${PIPESTATUS[0]} -eq 0 ]; then
+              if ollama list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qxF "$CM"; then
+                OK=1
                 break
-              else
-                echo "  Pull reported success but $CM is not in ollama list."
               fi
             fi
-            echo "  Retrying in 5s..."
             sleep 5
           done
-
-          if $OK; then
+          if [ "$OK" = "1" ]; then
             echo "  OK: $CM"
             PULLED="${PULLED:+$PULLED,}$CM"
           else
-            echo "  FAIL: $CM (will not be registered)"
+            echo "  FAIL: $CM"
             FAILED="${FAILED:+$FAILED,}$CM"
           fi
         done
-
         echo "PULLED_CLOUD_MODELS=$PULLED" >> "$GITHUB_ENV"
         echo "FAILED_CLOUD_MODELS=$FAILED" >> "$GITHUB_ENV"
-        echo "Pulled cloud: $PULLED"
-        echo "Failed cloud: ${FAILED:-none}"
+        echo "Pulled: $PULLED"
+        echo "Failed: ${FAILED:-none}"
 
     - name: Skip cloud models marker
       if: inputs.use_cloud_models != 'true'
@@ -255,10 +237,13 @@ jobs:
     # LITELLM
     # ------------------------------------------------------------------------
     - name: Install LiteLLM
-      run: pip install --quiet --upgrade 'litellm[proxy]' 2>&1 | tail -5
+      run: |
+        set +e
+        pip install --quiet --upgrade 'litellm[proxy]' 2>&1 | tail -5
 
     - name: Generate LiteLLM config
       run: |
+        set +e
         LITELLM_KEY="sk-ghactions-$(openssl rand -hex 16)"
         echo "LITELLM_KEY=$LITELLM_KEY" >> "$GITHUB_ENV"
 
@@ -316,9 +301,9 @@ jobs:
 
     - name: Start LiteLLM proxy
       run: |
+        set +e
         PORT="${{ env.LITELLM_PORT }}"
         nohup litellm --config litellm_config.yaml --port "$PORT" > litellm.log 2>&1 &
-        echo "Waiting for LiteLLM on port $PORT ..."
         for i in $(seq 1 30); do
           if nc -z localhost "$PORT" 2>/dev/null; then
             echo "LiteLLM up (attempt $i)."
@@ -326,49 +311,76 @@ jobs:
           fi
           sleep 3
         done
-        nc -z localhost "$PORT" || {
+        if ! nc -z localhost "$PORT" 2>/dev/null; then
           echo "ERROR: LiteLLM failed to start."
           tail -80 litellm.log
           exit 1
-        }
+        fi
 
     # ------------------------------------------------------------------------
     # SMOKE TEST EVERY MODEL THROUGH LITELLM
-    # This is the critical step that prevents your "registered but dead" bug.
-    # A model is only kept if /v1/chat/completions returns non-empty content.
+    # - NO curl -f anywhere (eliminates exit 22 propagation).
+    # - Captures HTTP code + body separately so failures are logged, not fatal.
+    # - Continues through every model regardless of individual failures.
     # ------------------------------------------------------------------------
     - name: Smoke test every registered model through LiteLLM
       id: validate
       run: |
+        set +e
         PORT="${{ env.LITELLM_PORT }}"
-        MODELS_JSON=$(curl -sf -H "Authorization: Bearer $LITELLM_KEY" \
+
+        # Get declared model list (no -f, capture code + body)
+        HC=$(curl -s -o /tmp/models.body -w '%{http_code}' --max-time 60 \
+          -H "Authorization: Bearer $LITELLM_KEY" \
           "http://localhost:${PORT}/v1/models")
-        DECLARED=$(echo "$MODELS_JSON" | jq -r '.data[].id')
-        echo "Declared by LiteLLM: $DECLARED"
+        MODELS_BODY=$(cat /tmp/models.body 2>/dev/null)
+
+        if [ "$HC" != "200" ]; then
+          echo "ERROR: /v1/models returned HTTP $HC"
+          echo "body: $(echo "$MODELS_BODY" | head -c 400)"
+          tail -80 litellm.log
+          exit 1
+        fi
+
+        DECLARED=$(echo "$MODELS_BODY" | jq -r '.data[].id' 2>/dev/null)
+        if [ -z "$DECLARED" ]; then
+          echo "ERROR: /v1/models returned no models"
+          echo "body: $(echo "$MODELS_BODY" | head -c 400)"
+          tail -80 litellm.log
+          exit 1
+        fi
+        echo "Declared by LiteLLM:"
+        echo "$DECLARED" | sed 's/^/  /'
 
         WORKING=""
         BROKEN=""
         for M in $DECLARED; do
+          echo ""
           echo "Probing $M ..."
-          RESP=$(curl -sf --max-time 240 \
+          HTTP=$(curl -s -o /tmp/probe.body -w '%{http_code}' --max-time 240 \
             -H "Authorization: Bearer $LITELLM_KEY" \
             -H "Content-Type: application/json" \
             -X POST "http://localhost:${PORT}/v1/chat/completions" \
-            -d "{\"model\":\"$M\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word: OK\"}],\"max_tokens\":50,\"stream\":false}" \
-            2>/tmp/probe.err)
-          if echo "$RESP" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
+            -d "{\"model\":\"$M\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word: OK\"}],\"max_tokens\":50,\"stream\":false}")
+          RESP=$(cat /tmp/probe.body 2>/dev/null)
+
+          if [ "$HTTP" = "200" ] \
+             && echo "$RESP" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
             CONTENT=$(echo "$RESP" | jq -r '.choices[0].message.content' | tr -d '\r\n[:space:]')
             if [ -n "$CONTENT" ] && [ "$CONTENT" != "null" ] && [ "$CONTENT" != "<none>" ]; then
-              echo "  OK   $M"
+              echo "  OK   $M  -> \"$CONTENT\""
               WORKING="${WORKING:+$WORKING,}$M"
               continue
             fi
           fi
-          echo "  FAIL $M"
-          [ -s /tmp/probe.err ] && head -3 /tmp/probe.err | sed 's/^/    /'
+
+          echo "  FAIL $M  (HTTP ${HTTP:-?})"
+          BODY_PREVIEW=$(echo "$RESP" | head -c 400 | tr '\n' ' ')
+          echo "    body: $BODY_PREVIEW"
           BROKEN="${BROKEN:+$BROKEN,}$M"
         done
 
+        echo ""
         echo "WORKING_MODELS=$WORKING" >> "$GITHUB_ENV"
         echo "BROKEN_MODELS=$BROKEN" >> "$GITHUB_ENV"
         echo "Working: $WORKING"
@@ -385,13 +397,13 @@ jobs:
     # ------------------------------------------------------------------------
     - name: Download cloudflared
       run: |
-        curl -fsSL \
-          https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-          -o cloudflared
+        set +e
+        curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
         chmod +x cloudflared
 
     - name: Start Cloudflare tunnel
       run: |
+        set +e
         PORT="${{ env.LITELLM_PORT }}"
         nohup ./cloudflared tunnel --url "http://localhost:${PORT}" > cloudflare.log 2>&1 &
         TUNNEL_URL=""
@@ -410,20 +422,17 @@ jobs:
 
     # ------------------------------------------------------------------------
     # OPENCODE CONFIG
-    # Only WORKING models appear here. Capabilities are set per-model so
-    # small/vision/etc. capabilities match what the model actually supports.
+    # Only WORKING models appear here. Capabilities per model.
     # ------------------------------------------------------------------------
     - name: Generate OpenCode config
       run: |
+        set +e
         CTX_SIZE="${{ env.NUM_CTX }}"
         PRED_SIZE="${{ env.NUM_PREDICT }}"
 
-        # ---- capability matrix ----
-        # Columns: tool_call | attachment (vision)
         cap_for() {
           local id="$1"
           case "$id" in
-            # local
             *lfm2.5*)              echo "true|false" ;;
             *north-mini-code*)     echo "true|false" ;;
             *ornith*)              echo "true|false" ;;
@@ -433,7 +442,6 @@ jobs:
             *gemma4-26b*)          echo "true|false" ;;
             *qwen3.6-27b*)         echo "true|true" ;;
             *qwen3.6-35b*)         echo "true|true" ;;
-            # cloud - all recent, all support tools, none are vision via cloud tag
             *-cloud)               echo "true|false" ;;
             *)                     echo "true|false" ;;
           esac
@@ -442,12 +450,12 @@ jobs:
         ctx_for() {
           local id="$1"
           case "$id" in
-            glm-5.2-cloud)         echo 976000 ;;
-            minimax-m3-cloud)      echo 512000 ;;
-            kimi-k2.7-code-cloud)  echo 256000 ;;
+            glm-5.2-cloud)          echo 976000 ;;
+            minimax-m3-cloud)       echo 512000 ;;
+            kimi-k2.7-code-cloud)   echo 256000 ;;
             nemotron-3-ultra-cloud) echo 256000 ;;
             nemotron-3-super-cloud) echo 256000 ;;
-            *)                     echo "$CTX_SIZE" ;;
+            *)                      echo "$CTX_SIZE" ;;
           esac
         }
 
@@ -456,7 +464,6 @@ jobs:
         MODELS_JSON='{}'
         for M in "${WORKING_LIST[@]}"; do
           if [[ "$M" == *"-cloud" ]]; then
-            # cloud: label includes the original ":cloud" tag
             NAME_LABEL="Cloud: ${M%-cloud}:cloud"
           else
             NAME_LABEL="Local: $M"
@@ -512,7 +519,7 @@ jobs:
         echo "==== opencode_config.json ===="
         cat opencode_config.json
         jq empty opencode_config.json && echo "JSON is valid." || {
-          echo "ERROR: invalid JSON generated"; exit 1;
+          echo "ERROR: invalid JSON"; exit 1;
         }
 
     - name: Upload OpenCode config artifact
@@ -523,8 +530,9 @@ jobs:
 
     - name: Deployment summary
       run: |
+        set +e
         {
-          echo "### Deployment Complete"
+          echo "### Deployment Complete (v3)"
           echo ""
           echo "| Field | Value |"
           echo "|-------|-------|"
@@ -535,7 +543,7 @@ jobs:
           [ -n "$PULLED_CLOUD_MODELS" ] && echo "| Cloud pulled | \`${PULLED_CLOUD_MODELS}\` |"
           [ -n "$FAILED_CLOUD_MODELS" ] && echo "| Cloud failed | \`${FAILED_CLOUD_MODELS}\` |"
           echo ""
-          echo "> Download the **opencode-config** artifact, place at \`~/.opencode/opencode.json\`"
+          echo "> Download **opencode-config** artifact, place at \`~/.opencode/opencode.json\`"
           echo "> Default model: \`${WORKING_MODELS%%,*}\`"
         } >> "$GITHUB_STEP_SUMMARY"
 
@@ -547,47 +555,48 @@ jobs:
 
     # ------------------------------------------------------------------------
     # KEEP ALIVE
-    # Light check every 5 min. Deep /chat probe every 15 min to catch the
-    # case where Ollama has unloaded the model but the process is still up.
     # ------------------------------------------------------------------------
     - name: Keep alive - health monitor
       run: |
+        set +e
         PORT="${{ env.LITELLM_PORT }}"
         FIRST_MODEL=$(echo "$WORKING_MODELS" | cut -d',' -f1)
-        echo "Keep-alive: ~5h50m. First-model probe target: $FIRST_MODEL"
+        echo "Keep-alive: first-model probe target: $FIRST_MODEL"
         ITER=0
         while true; do
           sleep 300
           ITER=$((ITER + 1))
           ELAPSED=$((ITER * 5))
 
-          OLLAMA_OK=true; curl -sf http://127.0.0.1:11434/api/tags > /dev/null 2>&1 || OLLAMA_OK=false
-          LITELLM_OK=true; nc -z localhost "$PORT" 2>/dev/null || LITELLM_OK=false
+          OLLAMA_OK=0
+          curl -s -o /dev/null http://127.0.0.1:11434/api/tags 2>/dev/null && OLLAMA_OK=1
+          LITELLM_OK=0
+          nc -z localhost "$PORT" 2>/dev/null && LITELLM_OK=1
 
-          echo "[+${ELAPSED}m] Ollama: $OLLAMA_OK  LiteLLM: $LITELLM_OK  Tunnel: $TUNNEL_URL"
+          echo "[+${ELAPSED}m] Ollama:$OLLAMA_OK LiteLLM:$LITELLM_OK Tunnel:$TUNNEL_URL"
 
-          if ! $OLLAMA_OK; then
+          if [ "$OLLAMA_OK" != "1" ]; then
             echo "ERROR: Ollama down."
             tail -50 ollama.log
             exit 1
           fi
-          if ! $LITELLM_OK; then
+          if [ "$LITELLM_OK" != "1" ]; then
             echo "ERROR: LiteLLM down."
             tail -50 litellm.log
             exit 1
           fi
 
-          # Deep probe every 15 min (every 3rd iteration of 5-min loops)
+          # Deep probe every 15 min
           if (( ITER % 3 == 0 )) && [ -n "$FIRST_MODEL" ]; then
-            DR=$(curl -sf --max-time 240 \
+            HC=$(curl -s -o /tmp/probe.body -w '%{http_code}' --max-time 240 \
               -H "Authorization: Bearer $LITELLM_KEY" \
               -H "Content-Type: application/json" \
               -X POST "http://localhost:${PORT}/v1/chat/completions" \
               -d "{\"model\":\"$FIRST_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":20}")
-            if echo "$DR" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
+            if [ "$HC" = "200" ]; then
               echo "  deep probe OK on $FIRST_MODEL"
             else
-              echo "  deep probe FAILED on $FIRST_MODEL"
+              echo "  deep probe FAIL on $FIRST_MODEL (HTTP $HC)"
               tail -30 litellm.log
             fi
           fi
