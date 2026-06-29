@@ -1,34 +1,21 @@
 name: Deploy Ollama + LiteLLM + Cloudflare Tunnel
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ARCHITECTURE OVERVIEW
+# HOW THIS WORKS
+# 1. Installs Ollama on the GitHub-hosted runner.
+# 2. Pulls the ONE local model selected from the dropdown.
+# 3. Creates a custom Modelfile to enforce num_ctx at inference time.
+# 4. Optionally pulls cloud models from the Ollama registry.
+# 5. Starts LiteLLM as an OpenAI-compatible proxy in front of Ollama.
+# 6. Opens a Cloudflare Quick Tunnel so LiteLLM is reachable remotely.
+# 7. Generates opencode_config.json listing every successfully pulled model.
+# 8. Stays alive up to ~5h50m, printing health status every 5 minutes.
 #
-#  1. Install Ollama on the GitHub-hosted runner.
-#  2. Pull ONE selected local model (your dropdown choice).
-#  3. Create a custom Modelfile so num_ctx is actually enforced at inference.
-#  4. Optionally pull cloud models (minimax-m3:cloud, kimi-k2.7-code:cloud, …)
-#     These are real Ollama registry models — ollama pull handles them the same
-#     way as any other model.
-#  5. Start LiteLLM as an OpenAI-compatible proxy in front of Ollama.
-#  6. Open a Cloudflare Quick Tunnel so you can reach LiteLLM from anywhere.
-#  7. Generate an opencode_config.json that lists every model that was
-#     successfully pulled.
-#  8. Stay alive for up to 6 hours (GitHub's maximum job duration), printing
-#     health status every 5 minutes so you can monitor the run in the Actions UI.
-#
-# ENVIRONMENT VARIABLE STRATEGY
-#  GitHub Actions evaluates  ${{ env.* }}  expressions at job startup — before
-#  any steps run — so values written to $GITHUB_ENV during a step are NOT
-#  visible to subsequent  ${{ env.* }}  references in the same job.
-#
-#  Solution used throughout this file:
-#    • Write to $GITHUB_ENV once (so the value survives across steps as a
-#      shell variable when each step sources the environment automatically).
-#    • Inside every step that needs a value set by a *previous* step, read it
-#      via the bare shell variable  $VAR  (not  ${{ env.VAR }} ).
-#    • The only ${{ env.* }} references kept below are for values defined in
-#      the top-level  env:  block, which ARE evaluated at startup.
-# ─────────────────────────────────────────────────────────────────────────────
+# ENV VARIABLE STRATEGY
+# ${{ env.VAR }} is evaluated BEFORE any step runs, so it cannot see values
+# written to $GITHUB_ENV by earlier steps.
+# Rule: ${{ env.VAR }} only for top-level env: block values.
+#       $VAR (bare shell) for anything written to $GITHUB_ENV at runtime.
+# GitHub auto-exports $GITHUB_ENV entries into every subsequent step's shell.
 
 on:
   workflow_dispatch:
@@ -48,7 +35,7 @@ on:
         default: lfm2.5
 
       use_cloud_models:
-        description: 'Also pull cloud models (minimax-m3:cloud, kimi-k2.7-code:cloud, etc.)'
+        description: 'Pull cloud models (minimax-m3, kimi-k2.7, gemma4, glm-5.2, qwen3:32b)'
         required: false
         type: choice
         options:
@@ -56,7 +43,6 @@ on:
           - 'false'
         default: 'false'
 
-# ── Top-level env: only for values known at workflow-parse time ───────────────
 env:
   OLLAMA_BASE_URL: 'http://127.0.0.1:11434'
   LITELLM_PORT: '4000'
@@ -65,93 +51,76 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    # GitHub's hard cap is 6 hours (360 min). Set just under to be safe.
     timeout-minutes: 350
 
     steps:
 
-    # ── 1. Checkout ──────────────────────────────────────────────────────────
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    # ── 2. System dependencies ───────────────────────────────────────────────
     - name: Install system dependencies
       run: |
         sudo apt-get update -q
         sudo apt-get install -y curl jq netcat-openbsd openssl
 
-    # ── 3. Python (for LiteLLM) ──────────────────────────────────────────────
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
 
-    # ── 4. Install Ollama ────────────────────────────────────────────────────
     - name: Install Ollama
       run: curl -fsSL https://ollama.com/install.sh | sh
 
-    # ── 5. Start Ollama service ──────────────────────────────────────────────
     - name: Start Ollama service
       run: |
-        # Serve with explicit host so it matches OLLAMA_BASE_URL
         OLLAMA_HOST=0.0.0.0:11434 ollama serve > ollama.log 2>&1 &
-
-        echo "Waiting for Ollama to become ready..."
+        echo "Waiting for Ollama..."
         for i in $(seq 1 30); do
           if curl -sf http://127.0.0.1:11434/api/tags > /dev/null 2>&1; then
-            echo "✅ Ollama is ready (attempt $i)."
+            echo "Ollama ready (attempt $i)."
             break
           fi
-          echo "  attempt $i/30 — sleeping 3s..."
+          echo "  attempt $i/30 - sleeping 3s..."
           sleep 3
         done
-
-        # Final check — fail fast if Ollama never came up
         curl -sf http://127.0.0.1:11434/api/tags > /dev/null || {
-          echo "❌ Ollama did not start. Log:"
+          echo "ERROR: Ollama did not start."
           cat ollama.log
           exit 1
         }
 
-    # ── 6. Pull selected local model & create custom context Modelfile ───────
+    # Pull the selected model, then write a Modelfile to enforce context size.
+    # IMPORTANT: We write the Modelfile using printf rather than a heredoc.
+    # Heredoc bodies that start at column 0 are seen as YAML document roots
+    # by the GitHub Actions parser and cause "invalid workflow file" errors.
+    # printf keeps all content inside the indented run: scalar, which is safe.
     - name: Pull local model and apply custom context
-      id: pull_local
       run: |
         INPUT_MODEL="${{ inputs.local_model }}"
-        echo "Selected model from input: $INPUT_MODEL"
+        CTX_SIZE="${{ env.NUM_CTX }}"
 
-        echo "Pulling $INPUT_MODEL …"
+        echo "Pulling model: $INPUT_MODEL"
         ollama pull "$INPUT_MODEL"
 
-        # Build a safe name for the custom model.
-        # Replace ':' with '-' so Ollama accepts it as a valid tag.
-        # Example:  ornith:9b  →  ornith-9b-ctx32k
+        # Safe name: ornith:9b -> ornith-9b-ctx32k
         SAFE_NAME=$(echo "$INPUT_MODEL" | tr ':' '-')
         CUSTOM_MODEL="${SAFE_NAME}-ctx32k"
 
-        echo "Creating Modelfile for $CUSTOM_MODEL …"
-        cat > Modelfile.custom << EOF
-FROM $INPUT_MODEL
-PARAMETER num_ctx ${{ env.NUM_CTX }}
-PARAMETER temperature 0.7
-PARAMETER num_predict 8192
-EOF
+        echo "Creating Modelfile for $CUSTOM_MODEL ..."
+        printf 'FROM %s\nPARAMETER num_ctx %s\nPARAMETER temperature 0.7\nPARAMETER num_predict 8192\n' \
+          "$INPUT_MODEL" "$CTX_SIZE" > Modelfile.custom
+
+        echo "Modelfile contents:"
+        cat Modelfile.custom
 
         ollama create "$CUSTOM_MODEL" -f Modelfile.custom
+        echo "Custom model created: $CUSTOM_MODEL"
 
-        echo "✅ Custom model created: $CUSTOM_MODEL"
-
-        # ── Write to GITHUB_ENV so later steps can use $MODEL_TO_USE ─────────
         echo "MODEL_TO_USE=$CUSTOM_MODEL" >> "$GITHUB_ENV"
 
-    # ── 7. Verify local model responds ───────────────────────────────────────
     - name: Verify local model is responsive
       run: |
-        # $MODEL_TO_USE is available as a shell variable because GitHub Actions
-        # automatically exports values written to $GITHUB_ENV into each step's
-        # shell environment.
         echo "Testing model: $MODEL_TO_USE"
-
         RESPONSE=$(curl -sf -X POST http://127.0.0.1:11434/api/chat \
           -H 'Content-Type: application/json' \
           -d "{
@@ -159,24 +128,18 @@ EOF
             \"messages\": [{\"role\": \"user\", \"content\": \"Reply with the single word: OK\"}],
             \"stream\": false
           }")
-
         if echo "$RESPONSE" | jq -e '.message.content' > /dev/null 2>&1; then
-          echo "✅ Model $MODEL_TO_USE is responding."
-          echo "   Response: $(echo "$RESPONSE" | jq -r '.message.content')"
+          echo "Model $MODEL_TO_USE is responding."
+          echo "Reply: $(echo "$RESPONSE" | jq -r '.message.content')"
         else
-          echo "❌ Model $MODEL_TO_USE did not respond correctly."
-          echo "   Raw response: $RESPONSE"
+          echo "ERROR: Model $MODEL_TO_USE did not respond."
+          echo "Raw: $RESPONSE"
           exit 1
         fi
 
-    # ── 8. Pull cloud models (optional) ─────────────────────────────────────
     - name: Pull cloud models
       if: inputs.use_cloud_models == 'true'
       run: |
-        # These model tags come directly from https://ollama.com/search
-        # If a pull fails the step continues — we track which ones succeeded
-        # so we can conditionally include them in LiteLLM / OpenCode configs.
-
         CLOUD_MODELS=(
           "minimax-m3:cloud"
           "kimi-k2.7-code:cloud"
@@ -185,136 +148,116 @@ EOF
           "qwen3:32b"
           "glm-5.2:cloud"
         )
-
         PULLED_CLOUD=""
-        for MODEL in "${CLOUD_MODELS[@]}"; do
-          echo "Pulling $MODEL …"
-          if ollama pull "$MODEL"; then
-            echo "  ✅ $MODEL pulled."
-            PULLED_CLOUD="$PULLED_CLOUD,$MODEL"
+        for CM in "${CLOUD_MODELS[@]}"; do
+          echo "Pulling $CM ..."
+          if ollama pull "$CM"; then
+            echo "  OK: $CM"
+            PULLED_CLOUD="${PULLED_CLOUD},${CM}"
           else
-            echo "  ⚠️  Could not pull $MODEL — skipping."
+            echo "  SKIP: $CM (pull failed)"
           fi
         done
-
-        # Strip leading comma
         PULLED_CLOUD="${PULLED_CLOUD#,}"
         echo "PULLED_CLOUD_MODELS=$PULLED_CLOUD" >> "$GITHUB_ENV"
-        echo "Successfully pulled cloud models: $PULLED_CLOUD"
+        echo "Pulled: $PULLED_CLOUD"
 
-    # Set an empty value when cloud models are disabled so later steps don't
-    # have to guard for an unset variable.
     - name: Mark cloud models as disabled
       if: inputs.use_cloud_models != 'true'
       run: echo "PULLED_CLOUD_MODELS=" >> "$GITHUB_ENV"
 
-    # ── 9. Install LiteLLM ───────────────────────────────────────────────────
     - name: Install LiteLLM
       run: pip install --quiet 'litellm[proxy]'
 
-    # ── 10. Generate LiteLLM config ──────────────────────────────────────────
+    # Generate litellm_config.yaml using printf for every line, avoiding
+    # any heredoc that would place content at column 0.
     - name: Generate LiteLLM config
       run: |
-        # Generate a random master key at runtime (not from env: block)
         LITELLM_KEY="sk-ghactions-$(openssl rand -hex 16)"
         echo "LITELLM_KEY=$LITELLM_KEY" >> "$GITHUB_ENV"
 
         OLLAMA_BASE="${{ env.OLLAMA_BASE_URL }}"
-        NUM_CTX="${{ env.NUM_CTX }}"
+        CTX_SIZE="${{ env.NUM_CTX }}"
 
-        # ── Local model entry ─────────────────────────────────────────────────
-        cat > litellm_config.yaml << YAML
-model_list:
-  # ── Local model (selected via workflow dropdown) ──────────────────────────
-  - model_name: ${MODEL_TO_USE}
-    litellm_params:
-      model: ollama_chat/${MODEL_TO_USE}
-      api_base: ${OLLAMA_BASE}
-      api_key: "ollama-local"
-      num_ctx: ${NUM_CTX}
-YAML
+        # Build config line by line with printf - no heredoc needed
+        {
+          printf 'model_list:\n'
+          printf '  - model_name: %s\n' "$MODEL_TO_USE"
+          printf '    litellm_params:\n'
+          printf '      model: ollama_chat/%s\n' "$MODEL_TO_USE"
+          printf '      api_base: %s\n' "$OLLAMA_BASE"
+          printf '      api_key: "ollama-local"\n'
+          printf '      num_ctx: %s\n' "$CTX_SIZE"
+        } > litellm_config.yaml
 
-        # ── Cloud model entries (only those that were actually pulled) ─────────
+        # Append one entry per successfully pulled cloud model
         if [ -n "$PULLED_CLOUD_MODELS" ]; then
           IFS=',' read -ra CLOUD_LIST <<< "$PULLED_CLOUD_MODELS"
-          for MODEL in "${CLOUD_LIST[@]}"; do
-            # Derive a clean display name: replace ':' with '-'
-            DISPLAY=$(echo "$MODEL" | tr ':' '-')
-            cat >> litellm_config.yaml << YAML
-  - model_name: ${DISPLAY}
-    litellm_params:
-      model: ollama_chat/${MODEL}
-      api_base: ${OLLAMA_BASE}
-      api_key: "ollama-cloud"
-YAML
+          for CM in "${CLOUD_LIST[@]}"; do
+            DISPLAY=$(echo "$CM" | tr ':' '-')
+            {
+              printf '  - model_name: %s\n' "$DISPLAY"
+              printf '    litellm_params:\n'
+              printf '      model: ollama_chat/%s\n' "$CM"
+              printf '      api_base: %s\n' "$OLLAMA_BASE"
+              printf '      api_key: "ollama-cloud"\n'
+            } >> litellm_config.yaml
           done
         fi
 
-        # ── General settings ──────────────────────────────────────────────────
-        cat >> litellm_config.yaml << YAML
+        # General settings - again with printf, no heredoc
+        {
+          printf '\ngeneral_settings:\n'
+          printf '  master_key: "%s"\n' "$LITELLM_KEY"
+          printf '\nlitellm_settings:\n'
+          printf '  drop_params: true\n'
+          printf '  set_tool_choice_to_always: false\n'
+          printf '  telemetry: false\n'
+          printf '  request_timeout: 600\n'
+        } >> litellm_config.yaml
 
-general_settings:
-  master_key: "${LITELLM_KEY}"
-
-litellm_settings:
-  drop_params: true
-  set_tool_choice_to_always: false
-  telemetry: false
-  request_timeout: 600
-YAML
-
-        echo "✅ litellm_config.yaml written:"
+        echo "litellm_config.yaml:"
         cat litellm_config.yaml
 
-    # ── 11. Start LiteLLM proxy ───────────────────────────────────────────────
     - name: Start LiteLLM proxy
       run: |
-        litellm --config litellm_config.yaml \
-          --port ${{ env.LITELLM_PORT }} \
-          > litellm.log 2>&1 &
-
-        echo "Waiting for LiteLLM on port ${{ env.LITELLM_PORT }} …"
+        PORT="${{ env.LITELLM_PORT }}"
+        litellm --config litellm_config.yaml --port "$PORT" > litellm.log 2>&1 &
+        echo "Waiting for LiteLLM on port $PORT ..."
         for i in $(seq 1 20); do
-          if nc -z localhost ${{ env.LITELLM_PORT }} 2>/dev/null; then
-            echo "✅ LiteLLM is up (attempt $i)."
+          if nc -z localhost "$PORT" 2>/dev/null; then
+            echo "LiteLLM is up (attempt $i)."
             break
           fi
-          echo "  attempt $i/20 — sleeping 3s..."
+          echo "  attempt $i/20 - sleeping 3s..."
           sleep 3
         done
-
-        nc -z localhost ${{ env.LITELLM_PORT }} || {
-          echo "❌ LiteLLM failed to start. Log:"
+        nc -z localhost "$PORT" || {
+          echo "ERROR: LiteLLM failed to start."
           cat litellm.log
           exit 1
         }
 
-    # ── 12. Validate LiteLLM model routes ────────────────────────────────────
     - name: Validate LiteLLM model routes
       run: |
-        echo "Checking /v1/models …"
+        PORT="${{ env.LITELLM_PORT }}"
+        echo "Checking /v1/models ..."
         MODELS_JSON=$(curl -sf \
           -H "Authorization: Bearer $LITELLM_KEY" \
-          http://localhost:${{ env.LITELLM_PORT }}/v1/models)
-
+          "http://localhost:${PORT}/v1/models")
         if [ -z "$MODELS_JSON" ]; then
-          echo "❌ Could not reach LiteLLM /v1/models. Log:"
+          echo "ERROR: Could not reach /v1/models."
           cat litellm.log
           exit 1
         fi
-
-        echo "✅ Models registered in LiteLLM:"
+        echo "Models in LiteLLM:"
         echo "$MODELS_JSON" | jq -r '.data[].id'
-
-        # Confirm the local model is present
-        if echo "$MODELS_JSON" | jq -r '.data[].id' | grep -q "^${MODEL_TO_USE}$"; then
-          echo "✅ Local model $MODEL_TO_USE confirmed in LiteLLM."
+        if echo "$MODELS_JSON" | jq -r '.data[].id' | grep -qF "$MODEL_TO_USE"; then
+          echo "Local model $MODEL_TO_USE confirmed."
         else
-          echo "⚠️  Local model $MODEL_TO_USE not found in LiteLLM model list."
-          echo "   This may be a timing issue — proceeding anyway."
+          echo "WARNING: $MODEL_TO_USE not found in model list. Proceeding anyway."
         fi
 
-    # ── 13. Download cloudflared ──────────────────────────────────────────────
     - name: Download cloudflared
       run: |
         curl -fsSL \
@@ -322,74 +265,55 @@ YAML
           -o cloudflared
         chmod +x cloudflared
 
-    # ── 14. Start Cloudflare tunnel ───────────────────────────────────────────
     - name: Start Cloudflare tunnel
       run: |
-        ./cloudflared tunnel \
-          --url http://localhost:${{ env.LITELLM_PORT }} \
-          > cloudflare.log 2>&1 &
-
-        echo "Waiting for Cloudflare tunnel URL …"
+        PORT="${{ env.LITELLM_PORT }}"
+        ./cloudflared tunnel --url "http://localhost:${PORT}" > cloudflare.log 2>&1 &
+        echo "Waiting for tunnel URL ..."
         TUNNEL_URL=""
         for i in $(seq 1 30); do
           TUNNEL_URL=$(grep -o 'https://[^ ]*trycloudflare\.com' cloudflare.log 2>/dev/null | head -n1)
           if [ -n "$TUNNEL_URL" ]; then
-            echo "✅ Tunnel URL: $TUNNEL_URL"
+            echo "Tunnel: $TUNNEL_URL"
             break
           fi
-          echo "  attempt $i/30 — sleeping 3s..."
+          echo "  attempt $i/30 - sleeping 3s..."
           sleep 3
         done
-
         if [ -z "$TUNNEL_URL" ]; then
-          echo "❌ Failed to obtain Cloudflare tunnel URL. Log:"
+          echo "ERROR: No tunnel URL found."
           cat cloudflare.log
           exit 1
         fi
-
         echo "TUNNEL_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
 
-    # ── 15. Generate opencode_config.json ─────────────────────────────────────
+    # Build opencode_config.json entirely with jq so JSON is always valid.
     - name: Generate OpenCode config
       run: |
-        TUNNEL="$TUNNEL_URL"
-        KEY="$LITELLM_KEY"
-        NUM_CTX="${{ env.NUM_CTX }}"
+        CTX_SIZE="${{ env.NUM_CTX }}"
 
-        # ── Build the "models" object dynamically ─────────────────────────────
-        # Start with the local model
         MODELS_JSON=$(jq -n \
-          --arg id "$MODEL_TO_USE" \
+          --arg id   "$MODEL_TO_USE" \
           --arg name "Local: $MODEL_TO_USE (32k ctx)" \
-          --argjson ctx "$NUM_CTX" \
-          '{
-            ($id): {
-              "id": $id,
-              "name": $name,
-              "tool_call": true,
-              "temperature": true,
-              "limit": {"context": $ctx, "output": 8192}
-            }
-          }')
+          --argjson ctx "$CTX_SIZE" \
+          '{($id): {"id": $id, "name": $name, "tool_call": true, "temperature": true, "limit": {"context": $ctx, "output": 8192}}}')
 
-        # Add cloud models if any were pulled
         if [ -n "$PULLED_CLOUD_MODELS" ]; then
           IFS=',' read -ra CLOUD_LIST <<< "$PULLED_CLOUD_MODELS"
-          for MODEL in "${CLOUD_LIST[@]}"; do
-            DISPLAY=$(echo "$MODEL" | tr ':' '-')
+          for CM in "${CLOUD_LIST[@]}"; do
+            DISPLAY=$(echo "$CM" | tr ':' '-')
             MODELS_JSON=$(echo "$MODELS_JSON" | jq \
-              --arg id "$DISPLAY" \
-              --arg name "Cloud: $MODEL" \
+              --arg id   "$DISPLAY" \
+              --arg name "Cloud: $CM" \
               '. + {($id): {"id": $id, "name": $name, "tool_call": true, "temperature": true}}')
           done
         fi
 
-        # ── Write final config ────────────────────────────────────────────────
         jq -n \
-          --arg baseURL "$TUNNEL/v1" \
-          --arg apiKey  "$KEY" \
+          --arg baseURL      "$TUNNEL_URL/v1" \
+          --arg apiKey       "$LITELLM_KEY" \
           --arg defaultModel "github-backend/$MODEL_TO_USE" \
-          --argjson models "$MODELS_JSON" \
+          --argjson models   "$MODELS_JSON" \
           '{
             "$schema": "https://opencode.ai/config.json",
             "provider": {
@@ -398,83 +322,77 @@ YAML
                 "name": "GitHub Actions LiteLLM Proxy",
                 "options": {
                   "baseURL": $baseURL,
-                  "apiKey":  $apiKey,
+                  "apiKey": $apiKey,
                   "timeout": 600000
                 },
                 "models": $models
               }
             },
             "model": $defaultModel,
-            "note": "This tunnel is temporary. It closes when the GitHub Actions job ends (max ~6 hours)."
+            "note": "Tunnel closes when the GitHub Actions job ends (max ~6 hours)."
           }' > opencode_config.json
 
-        echo "✅ opencode_config.json:"
+        echo "opencode_config.json:"
         cat opencode_config.json
 
-    # ── 16. Upload config as artifact ─────────────────────────────────────────
     - name: Upload OpenCode config artifact
       uses: actions/upload-artifact@v4
       with:
         name: opencode-config
         path: opencode_config.json
 
-    # ── 17. Print deployment summary ──────────────────────────────────────────
     - name: Deployment summary
       run: |
         {
-          echo "### ✅ Deployment Complete"
+          echo "### Deployment Complete"
           echo ""
           echo "| Field | Value |"
           echo "|-------|-------|"
-          echo "| **Tunnel URL** | \`$TUNNEL_URL/v1\` |"
-          echo "| **API Key** | \`$LITELLM_KEY\` |"
-          echo "| **Local Model** | \`$MODEL_TO_USE\` |"
-          echo "| **Cloud Models** | \`$PULLED_CLOUD_MODELS\` |"
+          echo "| Tunnel URL | \`${TUNNEL_URL}/v1\` |"
+          echo "| API Key | \`${LITELLM_KEY}\` |"
+          echo "| Local Model | \`${MODEL_TO_USE}\` |"
+          echo "| Cloud Models | \`${PULLED_CLOUD_MODELS:-none}\` |"
           echo ""
-          echo "> ⚠️ Download the **opencode-config** artifact above and place it in your project root."
-          echo "> The tunnel will close automatically when this job ends."
+          echo "> Download the **opencode-config** artifact and place it in your project root."
+          echo "> The tunnel closes automatically when this job ends."
         } >> "$GITHUB_STEP_SUMMARY"
 
-        echo ""
-        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        echo "  Tunnel URL : $TUNNEL_URL/v1"
-        echo "  API Key    : $LITELLM_KEY"
-        echo "  Local model: $MODEL_TO_USE"
-        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "============================================"
+        echo "  Tunnel URL : ${TUNNEL_URL}/v1"
+        echo "  API Key    : ${LITELLM_KEY}"
+        echo "  Local model: ${MODEL_TO_USE}"
+        echo "============================================"
 
-    # ── 18. Keep-alive loop (up to ~5 h 45 min) ──────────────────────────────
-    #
-    # Prints a health status every 5 minutes.
-    # If Ollama or LiteLLM dies, you'll see it in the live log immediately.
-    # The job's timeout-minutes: 350 enforces the outer limit.
-    - name: Keep alive — health monitor
+    # Health-check loop. Wakes every 5 minutes, prints status.
+    # Exits with error and shows logs if Ollama or LiteLLM goes down.
+    # The job's timeout-minutes: 350 is the hard outer limit (~5h50m).
+    - name: Keep alive - health monitor
       run: |
-        echo "Entering keep-alive loop. The job will run for up to 350 minutes."
-        echo "Health status is printed every 5 minutes."
-        echo ""
+        PORT="${{ env.LITELLM_PORT }}"
+        echo "Keep-alive started. Job runs up to 350 minutes."
+        echo "Health printed every 5 minutes."
 
-        ITERATION=0
+        ITER=0
         while true; do
           sleep 300
-          ITERATION=$((ITERATION + 1))
-          ELAPSED_MIN=$((ITERATION * 5))
+          ITER=$((ITER + 1))
+          ELAPSED=$((ITER * 5))
 
-          OLLAMA_OK="✅"
-          LITELLM_OK="✅"
+          OLLAMA_STATUS="OK"
+          LITELLM_STATUS="OK"
 
-          curl -sf http://127.0.0.1:11434/api/tags > /dev/null 2>&1 || OLLAMA_OK="❌ DOWN"
-          nc -z localhost ${{ env.LITELLM_PORT }} 2>/dev/null          || LITELLM_OK="❌ DOWN"
+          curl -sf http://127.0.0.1:11434/api/tags > /dev/null 2>&1 || OLLAMA_STATUS="DOWN"
+          nc -z localhost "$PORT" 2>/dev/null || LITELLM_STATUS="DOWN"
 
-          echo "[+${ELAPSED_MIN}m] Ollama: $OLLAMA_OK  |  LiteLLM: $LITELLM_OK  |  Tunnel: $TUNNEL_URL"
+          echo "[+${ELAPSED}m] Ollama: ${OLLAMA_STATUS}  LiteLLM: ${LITELLM_STATUS}  Tunnel: ${TUNNEL_URL}"
 
-          # If either service died, print logs and exit so the failure is visible
-          if [[ "$OLLAMA_OK" == *DOWN* ]]; then
-            echo "Ollama log tail:"
+          if [ "$OLLAMA_STATUS" = "DOWN" ]; then
+            echo "ERROR: Ollama is down."
             tail -30 ollama.log
             exit 1
           fi
-          if [[ "$LITELLM_OK" == *DOWN* ]]; then
-            echo "LiteLLM log tail:"
+          if [ "$LITELLM_STATUS" = "DOWN" ]; then
+            echo "ERROR: LiteLLM is down."
             tail -30 litellm.log
             exit 1
           fi
