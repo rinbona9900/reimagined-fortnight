@@ -112,9 +112,13 @@ jobs:
           echo "Add it at: Settings -> Secrets and variables -> Actions -> New repository secret"
           exit 1
         fi
-        mkdir -p "$HOME/.ollama"
+        # NOTE: Ollama stores credentials at ~/.ollama/.ollama/credentials
+        # (the inner .ollama/ is a real subdirectory, not a hidden file trick)
+        mkdir -p "$HOME/.ollama/.ollama"
         printf '%s' "$CLOUD_KEY" > "$HOME/.ollama/.ollama/credentials"
         chmod 600 "$HOME/.ollama/.ollama/credentials"
+        echo "Wrote credentials to $HOME/.ollama/.ollama/credentials"
+        ls -la "$HOME/.ollama/.ollama/"
         echo "Ollama Cloud credentials installed."
 
     - name: Install Ollama
